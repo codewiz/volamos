@@ -1369,6 +1369,7 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
                 "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
             ),
         })?;
+    ctx.mem.clear_fresh_block(addr, struct_size);
     for i in 0..struct_size {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
     }

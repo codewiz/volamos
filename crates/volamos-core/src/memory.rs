@@ -50,6 +50,21 @@ pub trait AddressSpace {
     /// Writes a single byte. Silently ignored if `addr` is out of range.
     fn write_u8(&mut self, addr: u32, value: u8);
 
+    /// Clears any sanitizer poison over `[addr, addr + len)`, a block the
+    /// guest heap has just handed out.
+    ///
+    /// Call this as soon as an allocation succeeds, *before* the handler
+    /// writes a header or zeroes the block: the heap recycles addresses,
+    /// so those bytes may still carry the `PoisonReason::Freed` marking
+    /// of the previous allocation, and writing over them does not clear
+    /// it -- the shadow map heals `Uninit` bytes but keeps
+    /// `Unaddressable` ones. Without this, the handler's own
+    /// initialization is reported as a use-after-free, and so is every
+    /// write the guest then makes.
+    ///
+    /// Default: nothing to do, for address spaces with no shadow map.
+    fn clear_fresh_block(&mut self, _addr: u32, _len: u32) {}
+
     /// Reads a big-endian 16-bit value. Any byte that falls out of range
     /// reads as `0`.
     fn read_u16(&self, addr: u32) -> u16 {
@@ -222,6 +237,12 @@ impl AddressSpace for FlatMemory {
             shadow.check_read(addr, 1);
         }
         self.bytes.get(addr as usize).copied().unwrap_or(0)
+    }
+
+    fn clear_fresh_block(&mut self, addr: u32, len: u32) {
+        if let Some(shadow) = &mut self.shadow {
+            shadow.mark_valid(addr, len);
+        }
     }
 
     fn write_u8(&mut self, addr: u32, value: u8) {

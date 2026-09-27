@@ -505,6 +505,7 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
             return Ok(());
         }
     };
+    ctx.mem.clear_fresh_block(port, MSGPORT_SIZE);
     init_msg_port_fields(ctx.mem, port, ctx.current_task);
     // After the field initialisation, never before: those writes heal
     // shadow bytes, so poisoning first would flag this handler's own
@@ -591,6 +592,7 @@ fn create_io_request(
     size: u32,
 ) -> Option<u32> {
     let addr = heap.alloc(size).ok()?;
+    mem.clear_fresh_block(addr, size);
     for i in 0..size {
         mem.write_u8(addr.wrapping_add(i), 0);
     }
