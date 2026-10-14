@@ -75,6 +75,26 @@ Changelog.
   a program's own hooking logic against itself, not for anything
   resembling a real system-wide patch tool (`Enforcer`, `SnoopDos`) —
   see the "Deliberately out of scope" note below on why.
+- Building libraries at runtime: `MakeLibrary` (including its `init`
+  routine), `MakeFunctions`, `InitStruct`, `AddLibrary`, `SumLibrary`
+  and `RemLibrary`. A library added this way (or by a disk library's
+  own init code) is openable by name and its jump table holds real
+  `JMP`s. `AddLibrary` sets `LIBF_SUMUSED` and computes `lib_Sum`;
+  `SumLibrary` rechecks it (a mismatch is a recovery Alert on
+  `stderr`) and `SetFunction` keeps it current. `RemLibrary` runs the
+  library's Expunge vector and only acts on libraries loaded from disk
+  or added with `AddLibrary` (built-in libraries have no Expunge, so it
+  is a no-op for them).
+- Resources: `AddResource`/`RemResource`/`OpenResource` over a real
+  `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
+  `cia.resource`, ...) are modelled; `OpenResource` of one returns
+  `NULL`.
+- `TypeOfMem`: addresses below 2 MiB (including the reserved low
+  region) report `MEMF_PUBLIC|MEMF_CHIP`; 2 MiB up to the end of guest
+  RAM reports `MEMF_PUBLIC|MEMF_FAST`; past the end of RAM (or the whole
+  range beyond a `--ram` smaller than 2 MiB) reports `0`. `AllocMem`
+  ignores the chip/fast flags, so an allocation's answer depends only
+  on where the heap placed it.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 
@@ -132,10 +152,3 @@ real AmigaOS code uses to call these functions.
 - **Cross-process IPC/message-port bridging** — volamos runs one guest
   process at a time (`System()`/`Execute()`/`RunCommand` run a nested
   program to completion synchronously, not concurrently).
-- **`exec.library`'s `MakeLibrary`** — creating a new library at
-  runtime is not exposed as a guest-callable LVO (the host-side
-  primitive it would use, `crate::execlib::make_library`, exists and
-  is exercised by the real-disk-library-loading path, but nothing
-  wires it up as `MakeLibrary` itself yet). `SetFunction`, which
-  patches an *existing* library's jump table, is implemented — see
-  `exec.library`'s entry above.

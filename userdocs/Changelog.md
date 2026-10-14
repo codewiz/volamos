@@ -5,6 +5,44 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **Non-`RTF_AUTOINIT` disk libraries, and the `exec.library` calls
+  their init code needs** (issue #133) — `OpenLibrary` can now load an
+  `NT_LIBRARY` whose `struct Resident` has no `RTF_AUTOINIT` flag, the
+  shape real Kickstart modules such as `graphics.library` use:
+  `rt_Init` is code that is called directly (`D0` = 0, `A0` = segList,
+  `A6` = ExecBase, as `InitResident` does) and builds the library
+  itself, returning the base in `D0`. Previously this was rejected
+  with "Resident isn't RTF_AUTOINIT". If the routine adds itself to
+  `LibList` but returns `NULL`, the library is found there by its
+  Resident name; if it does neither the open is refused. The loader
+  no longer double-links a library that already called `AddLibrary`,
+  and since such a library owns its base's memory (its Close/Expunge
+  code frees it, as on real exec) the host never frees or unlinks it a
+  second time on the last close. New guest-callable `MakeLibrary` (runs
+  its `init` routine too), `MakeFunctions`, `InitStruct` (the full
+  `exec/initializers.i` byte-command interpreter, which also means an
+  `RTF_AUTOINIT` library's non-`NULL` `InitStruct` table is now
+  applied instead of rejected) and `AddLibrary` (links the node into
+  `LibList` by priority and makes it openable by name, with no disk
+  file). Also added alongside, since a hand-rolled init commonly
+  reaches for them: `SumLibrary` (checksums the jump table's vector
+  addresses into `lib_Sum`; a mismatch on a library not marked
+  `LIBF_CHANGED` raises a recovery `Alert(AN_LibChkSum)`, reported on
+  `stderr`), with `AddLibrary` setting `LIBF_SUMUSED` and computing the
+  initial sum and `SetFunction` keeping it current; `RemLibrary` (calls
+  the library's own Expunge vector and, for a non-zero segList result,
+  unlinks/unloads it like the `CloseLibrary` delayed-expunge path, while
+  a zero result leaves it resident); `AddResource`/`RemResource`/
+  `OpenResource` on a real `ExecBase.ResourceList` (no built-in
+  resources are modelled, so `OpenResource` of e.g. `misc.resource`
+  returns `NULL`); and `TypeOfMem`, which classifies by address like a real machine: the
+  first 2 MiB (including the reserved low region) is chip RAM
+  (`MEMF_PUBLIC|MEMF_CHIP`), 2 MiB up to the end of guest RAM is fast
+  (`MEMF_PUBLIC|MEMF_FAST`), and anything past the end of RAM is `0`
+  (the chip range is capped when `--ram` is under 2 MiB). `AllocMem`
+  still ignores the chip/fast flags, so which answer an allocation gets
+  depends only on where the heap placed it. Interrupt servers and hardware access
+  from a library's init (custom-chip registers) remain out of scope.
 - **`--fpsp-emulate`** (issue #129) — software-emulates the
   instructions a real 68060 removed from silicon (most FPU
   transcendentals — FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/FINT/
