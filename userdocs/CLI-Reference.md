@@ -242,13 +242,38 @@ was actually compiled for.
 ## `--fpu`, `--no-fpu`
 
 Whether a coprocessor FPU is fitted. Default: no FPU. Only meaningful
-for `--cpu 68020` and later — earlier models have no coprocessor
+for `--cpu 68020`/`68030` — earlier models have no coprocessor
 interface at all, so F-line (FPU) instructions always trap on them
 regardless of this flag.
 
 ```sh
 volamos --cpu 68020 --fpu fixtures/hello
 ```
+
+The full `68040` and `68060` always have their on-die FPU on real
+hardware — unlike `68020`/`68030`, there's no plug-in 68881/68882 to
+leave out. `--fpu` is therefore a harmless no-op on `--cpu 68040`/
+`68060` ([issue #167](https://github.com/sidick/volamos/issues/167)).
+`--no-fpu` combined with `--cpu 68040` is substituted to
+`--cpu 68ec040` instead of silently having no effect, which is what it
+did before this was fixed — `AttnFlags` told the guest there was no
+FPU while FPU instructions still executed, a combination no real chip
+has:
+
+```console
+$ volamos --cpu 68040 --no-fpu fixtures/hello
+volamos: --cpu 68040 --no-fpu: the full 68040 always has its on-die FPU on real
+hardware, so running as --cpu 68ec040 instead (which really has no FPU) -- pass
+--cpu 68ec040 or --cpu 68lc040 directly to avoid this note
+Hello from volamos
+```
+
+Pass `--cpu 68ec040`/`--cpu 68lc040` directly to skip the note.
+
+`--cpu 68060 --no-fpu` is a separate, still-open issue (also tracked
+under #167) — the `m68k` crate *can* model an FPU-less 68060 internally,
+but doing so currently crashes volamos's own guest-exception routing,
+so this combination isn't refused yet, it just doesn't work.
 
 !!! note "Performance: software math libraries are faster than a real FPU"
     Programs that do floating-point math through `mathffp.library`/

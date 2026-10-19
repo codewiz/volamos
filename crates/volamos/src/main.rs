@@ -271,6 +271,17 @@ struct Options {
     stack_size: u32,
     ram_size: u32,
     cpu_type: CpuType,
+    /// Set by [`resolve_cpu_type_for_fpu`] (issue #167) when an
+    /// explicit `--cpu 68040 --no-fpu` (or `FPU=false` in a config
+    /// file) got silently substituted to `cpu_type ==
+    /// CpuType::M68EC040` -- "silently" only inside [`resolve`] itself;
+    /// [`run`] checks this and prints a one-line note, since
+    /// reinterpreting what `--cpu` named without saying so would be
+    /// its own kind of surprise. `false` for every other combination,
+    /// including a plain `--cpu 68040` (FPU present, no substitution
+    /// needed) and an already-FPU-less `--cpu 68ec040`/`68lc040`
+    /// (nothing to substitute).
+    cpu_fpu_substituted: bool,
     fpu: bool,
     jit: bool,
     /// See [`JitSource`]. `Default` whenever `jit` is `false`; otherwise
@@ -605,15 +616,17 @@ struct Cli {
     )]
     cpu: Option<CpuType>,
 
-    /// Fit a coprocessor FPU (default: no FPU; only meaningful for --cpu 68020+)
+    /// Fit a coprocessor FPU (default: no FPU; only meaningful for --cpu 68020/68030)
     #[arg(
         long = "fpu",
         action = ArgAction::SetTrue,
         overrides_with = "no_fpu",
         help_heading = "Machine",
         long_help = "Whether a coprocessor FPU is fitted (default: no FPU); only meaningful for \
-                      --cpu 68020 and later -- earlier models have no coprocessor interface at \
-                      all, so F-line (FPU) instructions always trap on them regardless."
+                      --cpu 68020/68030 -- earlier models have no coprocessor interface at all, \
+                      so F-line (FPU) instructions always trap on them regardless. The full \
+                      68040 and 68060 always have their on-die FPU on real hardware, so --fpu \
+                      is a harmless no-op there (issue #167)."
     )]
     fpu: bool,
 
@@ -622,7 +635,12 @@ struct Cli {
         long = "no-fpu",
         action = ArgAction::SetTrue,
         overrides_with = "fpu",
-        help_heading = "Machine"
+        help_heading = "Machine",
+        long_help = "Don't fit a coprocessor FPU; only meaningful for --cpu 68020/68030 (the \
+                      default either way). Combined with --cpu 68040 (issue #167), runs as \
+                      --cpu 68ec040 instead (printing a note) -- that model really has no FPU, \
+                      unlike the full 68040, which always has its on-die FPU on real hardware; \
+                      pass --cpu 68ec040 or --cpu 68lc040 directly to skip the note."
     )]
     no_fpu: bool,
 
@@ -1256,13 +1274,21 @@ fn attn_flags_for(cpu_type: CpuType, fpu: bool) -> u16 {
         flags |= AFF_68060;
     }
 
+    // The full M68040/M68060 always have their on-die FPU on real
+    // hardware -- unlike the 68020/68030, there is no "full chip, no
+    // FPU" combination to ask for (that needs the separate
+    // M68EC040/M68LC040 model, which has no FPU at all and so never
+    // sets this bit below, with or without `--fpu`). So this bit is
+    // unconditional for these two, not gated on `fpu` -- see issue
+    // #167, [`resolve`]'s `--cpu 68040 --no-fpu` substitution, and
+    // `parse_cpu_type`'s help text for `--cpu 68ec040`/`68lc040` for
+    // the only way to actually get a real FPU-less 68040.
+    if matches!(cpu_type, CpuType::M68040 | CpuType::M68060) {
+        flags |= AFF_FPU40;
+    }
+
     if fpu {
         match cpu_type {
-            // The 68040/68060's on-die FPU (M68EC040/M68LC040 have no
-            // FPU at all, so --fpu is a no-op there, matching real
-            // hardware -- there's no external-68881-socket option on
-            // those variants).
-            CpuType::M68040 | CpuType::M68060 => flags |= AFF_FPU40,
             CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => {
                 flags |= AFF_68881 | AFF_68882;
             }
@@ -1359,6 +1385,14 @@ fn parse_args_raw(args: impl Iterator<Item = String>) -> Result<RawParsedArgs, S
 /// producing the final [`Options`] `run` consumes. Used both by
 /// [`parse_args`] (CLI-only, no config files) and by `main` (after
 /// merging CLI overrides with `~/.volamos`/`.volamos`).
+///
+/// Applies [`resolve_cpu_type_for_fpu`]'s issue #167 substitution here,
+/// against `overrides.cpu_type`/`overrides.fpu` *before* either is
+/// defaulted -- that substitution must only trigger on an *explicit*
+/// `--no-fpu`/`FPU=false`, not on the implicit `fpu == false` every
+/// unrelated `--cpu` gets from [`Options::fpu`]'s own default, and by
+/// the time this function would otherwise default `cpu_type`/`fpu`
+/// itself, that distinction no longer exists.
 #[allow(clippy::too_many_arguments)] // internal helper; one param per CLI-only setting threaded past config::Overrides
 fn resolve(
     overrides: config::Overrides,
@@ -1371,6 +1405,8 @@ fn resolve(
     program: String,
     guest_args: Vec<String>,
 ) -> Options {
+    let (cpu_type, cpu_fpu_substituted) =
+        resolve_cpu_type_for_fpu(overrides.cpu_type, overrides.fpu);
     let jit = overrides.jit.unwrap_or(false);
     // See JitSource's doc: only matters when `jit` is actually `true`,
     // in which case it's either straight from this command line's own
@@ -1399,7 +1435,8 @@ fn resolve(
         libs_dir,
         stack_size: overrides.stack_size.unwrap_or(DEFAULT_STACK_SIZE),
         ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
-        cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
+        cpu_type,
+        cpu_fpu_substituted,
         fpu: overrides.fpu.unwrap_or(false),
         jit,
         jit_source,
@@ -1625,6 +1662,62 @@ fn check_ram_addressable(ram_size: u32, cpu_type: CpuType) -> Result<(), String>
          ask for a 32-bit address bus with --cpu 68020 (or any later model), or lower the \
          size to {addressable} or less (--ram on the command line, RAM= in a config file)"
     ))
+}
+
+/// Resolves what `cpu_type`/`fpu` actually mean together (issue #167):
+/// the full M68040 always has its on-die FPU on real hardware (see
+/// [`attn_flags_for`]'s doc), so there is no real "68040, but no FPU"
+/// machine for an *explicit* `--no-fpu` (or a config file's
+/// `FPU=false`) to model honestly -- unlike the 68020/68030, where a
+/// plain external 68881/68882 can genuinely be absent. Before this
+/// existed, `--no-fpu` combined with `--cpu 68040` silently had no
+/// effect at all: the `m68k` crate's own doc on `fpu_present` says
+/// plainly that "[t]he 040 models FPU absence through its EC/LC types
+/// instead, so this stays true for it" -- so the CPU core kept
+/// executing every FPU instruction regardless of the flag, while
+/// (before this issue's `attn_flags_for` fix) `AttnFlags` told the
+/// guest there was no FPU at all. A program that checks `AttnFlags`
+/// and one that just uses the FPU inline would have disagreed about
+/// what machine they were running on.
+///
+/// So an explicit `--cpu 68040 --no-fpu` is substituted to
+/// `CpuType::M68EC040` instead -- the model the `m68k` crate itself
+/// treats as having no on-die FPU at all (`--cpu 68lc040` would do
+/// equally well; `--fpu`/`--no-fpu` are documented no-ops on both,
+/// since neither has any FPU to toggle. `M68EC040` is picked as the
+/// one concrete choice since this runtime doesn't model the MMU
+/// either has -- there's nothing behavioral to prefer one over the
+/// other for). This keeps `--no-fpu` meaning something real rather
+/// than either silently doing nothing (the original bug) or refusing
+/// the whole run outright for what is, after all, an unambiguous
+/// request once you know real hardware has a name for it. [`run`]
+/// prints a one-line note when this substitution happens (see
+/// [`Options::cpu_fpu_substituted`]) -- a silent reinterpretation of
+/// what `--cpu` actually names would be its own kind of surprise.
+///
+/// Only triggered by an *explicit* `fpu == Some(false)` -- plain
+/// `--cpu 68040` with neither `--fpu` nor `--no-fpu` given at all
+/// (`fpu == None`) is left alone: it keeps matching real hardware
+/// (FPU always present), just with the `AttnFlags` lie now fixed too.
+/// `--cpu 68040 --fpu` (`fpu == Some(true)`) is also left alone --
+/// explicitly asking for the FPU hardware already has is a harmless
+/// no-op, not a contradiction needing any substitution.
+///
+/// Deliberately does **not** cover `--cpu 68060 --no-fpu`: the `m68k`
+/// crate *can* model an FPU-less 68060 directly (via
+/// `fpu_present = false`, which sets `PCR.DFP`), unlike the 68040 case
+/// this function is about, where only a different `CpuType` achieves
+/// it -- but doing so currently crashes volamos's own guest-exception
+/// routing in a different way (issue #167's second half, tracked
+/// separately -- not yet fixed, deliberately out of this function's
+/// scope). There is no `CpuType` to substitute to for the 68060 case
+/// even if there were a reason to.
+fn resolve_cpu_type_for_fpu(cpu_type: Option<CpuType>, fpu: Option<bool>) -> (CpuType, bool) {
+    if cpu_type == Some(CpuType::M68040) && fpu == Some(false) {
+        (CpuType::M68EC040, true)
+    } else {
+        (cpu_type.unwrap_or(CpuType::M68000), false)
+    }
 }
 
 /// Refuses `--clock-mhz` together with `jit` set (issue #102): `jit`
@@ -1903,6 +1996,13 @@ fn run(opts: &Options) -> Result<i32, String> {
     // a run that somehow violates both reports the --jit conflict
     // first -- there's no other significance to the order.
     check_ram_addressable(opts.ram_size, opts.cpu_type)?;
+    if opts.cpu_fpu_substituted {
+        eprintln!(
+            "volamos: --cpu 68040 --no-fpu: the full 68040 always has its on-die FPU on real \
+             hardware, so running as --cpu 68ec040 instead (which really has no FPU) -- pass \
+             --cpu 68ec040 or --cpu 68lc040 directly to avoid this note"
+        );
+    }
     if opts.sanitize.emu68_debug && addressable_bytes(opts.cpu_type) < (1 << 32) {
         eprintln!(
             "volamos: emu68-debug: the port at 0xDEADBEEF is inactive with --cpu {}: that CPU \
@@ -2856,6 +2956,85 @@ mod tests {
         assert!(opts.fpu);
     }
 
+    // --- resolve_cpu_type_for_fpu (issue #167) ---
+
+    #[test]
+    fn cpu_68040_with_explicit_no_fpu_substitutes_68ec040() {
+        let opts = parse_args(args(&["--cpu", "68040", "--no-fpu", "prog"])).unwrap();
+        assert_eq!(opts.cpu_type, CpuType::M68EC040);
+        assert!(opts.cpu_fpu_substituted);
+    }
+
+    #[test]
+    fn cpu_68040_with_explicit_fpu_is_accepted_as_a_no_op() {
+        // --cpu 68040 always has its FPU; explicitly asking for it is
+        // a harmless no-op, not a contradiction needing substitution.
+        let opts = parse_args(args(&["--cpu", "68040", "--fpu", "prog"])).unwrap();
+        assert_eq!(opts.cpu_type, CpuType::M68040);
+        assert!(opts.fpu);
+        assert!(!opts.cpu_fpu_substituted);
+    }
+
+    #[test]
+    fn cpu_68040_with_neither_fpu_flag_is_accepted() {
+        // The implicit `fpu == false` every unrelated --cpu gets from
+        // Options::fpu's own default must NOT trigger the same
+        // substitution as an *explicit* --no-fpu -- see
+        // resolve_cpu_type_for_fpu's doc on why this has to be checked
+        // before that default is applied.
+        let opts = parse_args(args(&["--cpu", "68040", "prog"])).unwrap();
+        assert_eq!(opts.cpu_type, CpuType::M68040);
+        assert!(!opts.fpu);
+        assert!(!opts.cpu_fpu_substituted);
+    }
+
+    #[test]
+    fn cpu_68ec040_with_no_fpu_is_accepted_without_substitution() {
+        // Already the real FPU-less model -- nothing to substitute.
+        let opts = parse_args(args(&["--cpu", "68ec040", "--no-fpu", "prog"])).unwrap();
+        assert_eq!(opts.cpu_type, CpuType::M68EC040);
+        assert!(!opts.cpu_fpu_substituted);
+    }
+
+    #[test]
+    fn cpu_68060_with_no_fpu_is_not_substituted() {
+        // Deliberately out of scope for resolve_cpu_type_for_fpu -- see
+        // its doc's last paragraph. The 68060 half of issue #167 (a
+        // crash) is tracked separately and not fixed here; there is no
+        // CpuType to substitute to even if there were a reason to.
+        let (cpu_type, substituted) = resolve_cpu_type_for_fpu(Some(CpuType::M68060), Some(false));
+        assert_eq!(cpu_type, CpuType::M68060);
+        assert!(!substituted);
+    }
+
+    #[test]
+    fn resolve_cpu_type_for_fpu_is_a_no_op_for_every_other_combination() {
+        assert_eq!(
+            resolve_cpu_type_for_fpu(None, None),
+            (CpuType::M68000, false)
+        );
+        assert_eq!(
+            resolve_cpu_type_for_fpu(Some(CpuType::M68040), None),
+            (CpuType::M68040, false)
+        );
+        assert_eq!(
+            resolve_cpu_type_for_fpu(Some(CpuType::M68040), Some(true)),
+            (CpuType::M68040, false)
+        );
+        assert_eq!(
+            resolve_cpu_type_for_fpu(Some(CpuType::M68000), Some(false)),
+            (CpuType::M68000, false)
+        );
+        assert_eq!(
+            resolve_cpu_type_for_fpu(Some(CpuType::M68EC040), Some(false)),
+            (CpuType::M68EC040, false)
+        );
+        assert_eq!(
+            resolve_cpu_type_for_fpu(Some(CpuType::M68LC040), Some(false)),
+            (CpuType::M68LC040, false)
+        );
+    }
+
     // --- clap migration: new coverage for behavior the hand-rolled
     // parser couldn't exercise (unknown-flag handling) or that's worth
     // pinning explicitly now that clap, not a hand-written match, is
@@ -3576,18 +3755,37 @@ mod tests {
     }
 
     #[test]
-    fn attn_flags_68040_sets_every_lower_cpu_bit() {
+    fn attn_flags_68040_always_sets_fpu40_regardless_of_the_fpu_arg() {
+        // Issue #167: the full 68040 always has its on-die FPU on real
+        // hardware, so AFF_FPU40 must not depend on `fpu` at all --
+        // an *explicit* `--cpu 68040 --no-fpu` is substituted to
+        // CpuType::M68EC040 by resolve_cpu_type_for_fpu before this is
+        // ever reached, but `fpu` still defaults to `false` for a
+        // plain `--cpu 68040` (which keeps cpu_type == M68040, no
+        // substitution), so this must report the real hardware truth
+        // either way.
         assert_eq!(
             attn_flags_for(CpuType::M68040, false),
-            0x1 | 0x2 | 0x4 | 0x8
+            0x1 | 0x2 | 0x4 | 0x8 | (1 << 6)
+        );
+        assert_eq!(
+            attn_flags_for(CpuType::M68040, true),
+            0x1 | 0x2 | 0x4 | 0x8 | (1 << 6)
         );
     }
 
     #[test]
-    fn attn_flags_68060_sets_every_lower_cpu_bit_plus_its_own() {
+    fn attn_flags_68060_always_sets_fpu40_regardless_of_the_fpu_arg() {
+        // Same reasoning as the 68040 test above -- the full 68060
+        // (the only CpuType this crate models for "68060") always has
+        // its on-die FPU too.
         assert_eq!(
             attn_flags_for(CpuType::M68060, false),
-            0x1 | 0x2 | 0x4 | 0x8 | 0x80
+            0x1 | 0x2 | 0x4 | 0x8 | 0x80 | (1 << 6)
+        );
+        assert_eq!(
+            attn_flags_for(CpuType::M68060, true),
+            0x1 | 0x2 | 0x4 | 0x8 | 0x80 | (1 << 6)
         );
     }
 
@@ -3604,14 +3802,6 @@ mod tests {
         assert_eq!(
             attn_flags_for(CpuType::M68030, true),
             0x1 | 0x2 | 0x4 | (1 << 4) | (1 << 5)
-        );
-    }
-
-    #[test]
-    fn attn_flags_68040_with_fpu_sets_fpu40_not_68881() {
-        assert_eq!(
-            attn_flags_for(CpuType::M68040, true),
-            0x1 | 0x2 | 0x4 | 0x8 | (1 << 6)
         );
     }
 
