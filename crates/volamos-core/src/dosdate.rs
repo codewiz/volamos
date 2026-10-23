@@ -54,7 +54,7 @@ const TICKS_PER_SECOND: u32 = 50;
 
 /// Days from the Unix epoch (1970-01-01) to the Amiga epoch
 /// (1978-01-01): 8 full years, 2 of them leap (1972, 1976).
-const UNIX_TO_AMIGA_EPOCH_DAYS: i64 = 8 * 365 + 2;
+pub(crate) const UNIX_TO_AMIGA_EPOCH_DAYS: i64 = 8 * 365 + 2;
 
 /// Computes `(ds_Days, ds_Minute, ds_Tick)` for the current host wall
 /// clock. Saturates to `0` if the host clock is somehow before the
@@ -74,17 +74,12 @@ pub(crate) fn now_as_datestamp() -> (i32, i32, i32) {
     let secs_of_day = amiga_secs % 86_400;
     let minute = secs_of_day / 60;
     let secs_of_minute = secs_of_day % 60;
-    // Sub-second precision (the fractional tick within the current
-    // second) matters beyond DateStamp's own 1/50s granularity: this
-    // same (days, minute, tick) triple backs `GetSysTime`'s `tv_micro`
-    // (see `host_time_secs_micro` in `crate::exectask`) and
-    // `ReadEClock`'s absolute tick count, both of which real callers use
-    // for sub-second elapsed-time measurement (e.g. `WaitSelect`'s
-    // conformance-suite timeout tests). Dropping the fractional second
-    // here (as an earlier version did, via `.as_secs()` alone) made
-    // `tick` always an exact multiple of `TICKS_PER_SECOND`, silently
-    // pinning `tv_micro` to 0 forever -- a real bug, not a rounding
-    // nicety.
+    // Keep the fractional second: dropping it (as an earlier version
+    // did, via `.as_secs()` alone) made `tick` always an exact multiple
+    // of `TICKS_PER_SECOND`. `GetSysTime` and `ReadEClock` were built on
+    // this triple then, and that pinned `tv_micro` to 0 forever; they
+    // now read the host clock directly (see `host_time_secs_micro` in
+    // `crate::exectask`) to get microseconds.
     let tick =
         secs_of_minute * i64::from(TICKS_PER_SECOND) + i64::from(now.subsec_nanos()) / 20_000_000;
     (days as i32, minute as i32, tick as i32)
