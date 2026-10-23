@@ -1388,15 +1388,21 @@ fn abort_io_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// plus microseconds -- the value `GetSysTime`/`TR_GETSYSTIME` report,
 /// per the RKRM Devices book's "Timer Device" chapter ("By convention,
 /// it tells how many seconds have passed since midnight, January 1,
-/// 1978"). Built on [`crate::dosdate::now_as_datestamp`], the same
-/// clock every other date-facing call here uses. Also reused by
-/// `crate::intuition`'s `CurrentTime`, which is documented to report
-/// exactly this same epoch/units.
+/// 1978"). Reads the same host clock as
+/// [`crate::dosdate::now_as_datestamp`], but keeps the microseconds
+/// instead of going through DateStamp's 1/50s ticks: `ReadEClock` is
+/// built on this too, and programs time short intervals with it. Also
+/// reused by `crate::intuition`'s `CurrentTime`, which is documented to
+/// report exactly this same epoch/units.
 pub(crate) fn host_time_secs_micro() -> (u32, u32) {
-    let (days, minute, tick) = crate::dosdate::now_as_datestamp();
-    let secs = (days as i64) * 86_400 + (minute as i64) * 60 + (tick as i64) / 50;
-    let micro = (tick as i64 % 50) * 20_000;
-    (secs as u32, micro as u32)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64 - crate::dosdate::UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+    if secs < 0 {
+        return (0, 0);
+    }
+    (secs as u32, now.subsec_micros())
 }
 
 /// Reads a `struct timeval` (`tv_secs`/`tv_micro`, both `ULONG`) at
@@ -3209,6 +3215,16 @@ mod tests {
             rt.memory().read_u32(ev_addr) > 0,
             "ev_hi should be non-zero"
         );
+    }
+
+    /// The host clock behind `GetSysTime` and `ReadEClock` must resolve
+    /// microseconds, not DateStamp's 1/50s ticks: with the latter, every
+    /// `tv_micro` was a multiple of 20000 and every interval timed with
+    /// `ReadEClock` a multiple of 20 ms.
+    #[test]
+    fn host_time_has_microsecond_resolution() {
+        let off_tick = (0..1000).any(|_| !host_time_secs_micro().1.is_multiple_of(20_000));
+        assert!(off_tick, "every sample fell on a 1/50s boundary");
     }
 
     // --- ReadEClock under --clock-mhz (issue #102) ---
