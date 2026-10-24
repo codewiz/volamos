@@ -247,7 +247,7 @@
 //!    [`crate::guestmem::MIN_STACK_SIZE`], matching
 //!    [`crate::dispatch::Runtime::new`]'s own clamp) from the *caller's*
 //!    [`GuestHeap`], saving the current task's `A7`/`tc_SPLower`/
-//!    `tc_SPUpper`/`pr_Arguments`/[`DosState::cmdline`]/`cmdline_pos`/
+//!    `tc_SPUpper`/`pr_Arguments`/[`DosState::input_buf`]/`input_pos`/
 //!    `A6` first --
 //!    same bookkeeping [`crate::exectask`]'s `StackSwap` handler already
 //!    does for the same reason (a stack swap entirely within one
@@ -285,6 +285,7 @@ use crate::dosfile::{
     DosState, ERROR_FILE_NOT_OBJECT, ERROR_NO_FREE_STORE, MODE_OLDFILE, OFFSET_CURRENT,
     map_io_error, map_vfs_error,
 };
+use crate::dospattern::ERROR_LINE_TOO_LONG;
 use crate::exectask::{PR_ARGUMENTS_OFFSET, TC_SPLOWER, TC_SPUPPER};
 use crate::guestmem::{
     GuestHeap, GuestHeapError, MIN_STACK_SIZE, addr_from_bptr, bptr_from_addr, read_c_string,
@@ -1022,6 +1023,15 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // segment's payload address, immediately past its header.
     let entry = alloc_addrs[0].wrapping_add(SEG_HEADER_SIZE);
 
+    // The arguments are copied into the Input() buffer below, so they
+    // must lie inside guest memory: a length past it cannot be a real
+    // argument string, and must not make the host allocate gigabytes.
+    if u64::from(param_ptr) + u64::from(param_len) > ctx.mem.len() as u64 {
+        ctx.dos.set_io_err(ERROR_LINE_TOO_LONG);
+        ctx.cpu.set_data_register(DataRegister(0), (-1i32) as u32);
+        return Ok(());
+    }
+
     let stack_size = requested_stack.max(MIN_STACK_SIZE);
     let stack_base = match ctx.heap.alloc(ctx.mem, stack_size) {
         Ok(addr) => addr,
@@ -1047,8 +1057,8 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let old_sp_lower = ctx.mem.read_u32(task + TC_SPLOWER);
     let old_sp_upper = ctx.mem.read_u32(task + TC_SPUPPER);
     let old_pr_arguments = ctx.mem.read_u32(task + PR_ARGUMENTS_OFFSET);
-    let old_cmdline = ctx.dos.cmdline;
-    let old_cmdline_pos = ctx.dos.cmdline_pos;
+    let old_input_buf = std::mem::take(&mut ctx.dos.input_buf);
+    let old_input_pos = ctx.dos.input_pos;
 
     let entry_sp = stack_top & !3;
     ctx.cpu.set_address_register(AddressRegister(7), entry_sp);
@@ -1058,15 +1068,15 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // a guest startup may read this instead of (or in addition to)
     // A0/D0, so it has to describe the same buffer.
     ctx.mem.write_u32(task + PR_ARGUMENTS_OFFSET, param_ptr);
-    ctx.dos.cmdline = Some((param_ptr, param_len));
-    // ReadArgs's cursor into dos.cmdline -- must restart at the child's
-    // own buffer's beginning, not wherever the caller's own prior
-    // ReadArgs call(s) left it (this field persists across calls, see
-    // crate::dosargs's module doc): without resetting it here, a
-    // RunCommand'd program's own first ReadArgs call would start
-    // partway (often at the very end) of *its* command line instead of
-    // the start, parsing as if no arguments were given at all.
-    ctx.dos.cmdline_pos = 0;
+    // The child's arguments go into the Input() buffer, read from the
+    // start, and the caller's buffer comes back when the child returns:
+    // RunCommand "takes care of setting up the current input filehandle
+    // in such a way that ReadArgs() can be used in the program, and
+    // restores the state of the buffering before returning" (autodoc).
+    ctx.dos.input_buf = (0..param_len)
+        .map(|i| ctx.mem.read_u8(param_ptr.wrapping_add(i)))
+        .collect();
+    ctx.dos.input_pos = 0;
     ctx.cpu
         .set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
     // A0/D0 = argptr/argsize verbatim, exactly as RunCommand's caller
@@ -1095,8 +1105,8 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             ctx.mem.write_u32(task + TC_SPUPPER, old_sp_upper);
             ctx.mem
                 .write_u32(task + PR_ARGUMENTS_OFFSET, old_pr_arguments);
-            ctx.dos.cmdline = old_cmdline;
-            ctx.dos.cmdline_pos = old_cmdline_pos;
+            ctx.dos.input_buf = old_input_buf;
+            ctx.dos.input_pos = old_input_pos;
             if let Some(shadow) = ctx.mem.shadow_mut() {
                 shadow.reset_stack_tracking(old_sp_lower, old_sp_upper, old_a7);
             }
@@ -1830,6 +1840,49 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::vec_init_then_push)] // one `.push()` per word, each commented
+    fn run_command_rejects_arguments_past_guest_memory() {
+        // The arguments are copied into the Input() buffer, so a length
+        // reaching past guest memory has to fail before the host tries to
+        // allocate and copy it. The child would exit with 42.
+        let child_words = [move_imm_to_d(0), 0, 42, RTS];
+        let tmp = TempDir::new("args-past-memory");
+        fs::write(tmp.path().join("child"), hunk_file_from_words(&child_words)).unwrap();
+        let name = b"SYS:child\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name ptr (patched below)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -150); // LoadSeg
+        words.push(move_d0_to_d(1)); // D1 = seglist BPTR
+        words.push(move_imm_to_d(2)); // D2 = stack size
+        words.push(0);
+        words.push(8192);
+        words.push(move_imm_to_d(3)); // D3 = paramptr
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(4)); // D4 = paramlen: 4 GB
+        words.push(0xFFFF);
+        words.push(0xFF00);
+        push_jsr(&mut words, 6, -504); // RunCommand
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+
+        assert_eq!(
+            code, -1,
+            "RunCommand should refuse the length, not run the child"
+        );
+    }
+
+    #[test]
     fn run_command_child_inherits_the_callers_fpcr() {
         // Child: FMOVE.L FPCR,D0 ; RTS -- reports back, as its own exit
         // code, whatever FPCR it saw at startup. If RunCommand ran it on
@@ -1940,9 +1993,9 @@ mod tests {
     #[allow(clippy::vec_init_then_push)] // one `.push()` per word, each commented
     fn run_command_resets_readargs_cursor_for_the_child_instead_of_inheriting_the_callers() {
         // The parent calls ReadArgs on *its own* command line first,
-        // advancing DosState::cmdline_pos partway (here, all the way)
+        // advancing DosState::input_pos partway (here, all the way)
         // into the parent's buffer. Without resetting that cursor for
-        // the child (DosState::cmdline_pos is a single, shared field --
+        // the child (DosState::input_pos is a single, shared field --
         // see crate::dosargs's module doc), the child's own ReadArgs
         // call would start wherever the parent's left off, typically
         // past the end of the *child's* entirely different buffer,
@@ -1988,7 +2041,7 @@ mod tests {
 
         let mut words = Vec::new();
         // Parent's own ReadArgs call first, against its own command
-        // line ("PARENT_TOKEN", below) -- advances cmdline_pos.
+        // line ("PARENT_TOKEN", below) -- advances input_pos.
         let parent_template_idx = words.len();
         words.push(move_imm_to_d(1));
         words.push(0);
@@ -2067,7 +2120,7 @@ mod tests {
             read_c_string(rt.memory(), matched_ptr),
             b"CHILD_TOKEN",
             "the child's ReadArgs should parse the child's own command line from its start, \
-             not wherever the parent's prior ReadArgs call left DosState::cmdline_pos"
+             not wherever the parent's prior ReadArgs call left DosState::input_pos"
         );
     }
 

@@ -442,20 +442,25 @@ pub struct DosState {
     // the sibling module" convention as the T11/Phase-3-stage-7 fields
     // above), but the fields themselves are declared here per that same
     // convention.
-    /// Guest address of the process's command-line buffer (the `A0`/`D0`
-    /// buffer [`crate::dispatch::Runtime::new`] builds from
-    /// [`crate::dispatch::StartConfig::args`]) and its length in bytes
-    /// (including the trailing `'\n'`). This is `ReadArgs`'s default
-    /// input source (`rdargs == NULL`), mirroring how real AmigaOS
-    /// delivers the CLI command tail through the process's buffered
-    /// `Input()` -- see `crate::dosargs`'s module docs.
-    pub(crate) cmdline: Option<(u32, u32)>,
-    /// Byte offset into `cmdline` that the next default-source `ReadArgs`
-    /// call resumes from -- real `ReadArgs(NULL)` reads from a shared,
-    /// stateful input stream, so repeated calls in one process walk
-    /// forward through the same buffer rather than each re-parsing it
-    /// from the start.
-    pub(crate) cmdline_pos: u32,
+    /// The command line, as `RunCommand` stuffs it into the buffer of
+    /// the process's `Input()`, including the trailing `'\n'`: the text
+    /// of the `A0`/`D0` buffer [`crate::dispatch::Runtime::new`] builds
+    /// from [`crate::dispatch::StartConfig::args`], or of the arguments
+    /// `RunCommand` gets. The `RunCommand` autodoc: it "takes care of
+    /// setting up the current input filehandle in such a way that
+    /// ReadArgs() can be used in the program, and restores the state of
+    /// the buffering before returning"; `ReadArgs` "normally gets the
+    /// arguments by reading buffered IO from Input()". AROS does the same
+    /// (`rom/dos/runcommand.c`, `vbuf_inject()`), after the Guru Book.
+    ///
+    /// So `ReadArgs(NULL)` and buffered reads of the current `Input()`
+    /// (`FGetC`, `FGets`, `FRead`) take these bytes before the host
+    /// stream, and the guest's `A0` buffer is not involved: C startup
+    /// code splits that into argv in place (vbcc's writes a NUL over the
+    /// `'\n'`), which real `ReadArgs` never sees.
+    pub(crate) input_buf: Vec<u8>,
+    /// How much of `input_buf` has been read.
+    pub(crate) input_pos: usize,
     /// Live `ReadArgs` results, keyed by the `struct RDArgs*` anchor
     /// address returned in `D0` (see `crate::dosargs::RDARGS_STRUCT_SIZE`).
     /// `FreeArgs` looks up and frees every heap block an entry lists, plus
@@ -545,8 +550,8 @@ impl DosState {
             seglists: HashMap::new(),
             overlay_roots: HashMap::new(),
             system_runner: None,
-            cmdline: None,
-            cmdline_pos: 0,
+            input_buf: Vec::new(),
+            input_pos: 0,
             rdargs: HashMap::new(),
             local_vars: HashMap::new(),
             anchor_states: HashMap::new(),
@@ -960,6 +965,18 @@ impl DosState {
         } else {
             false
         }
+    }
+
+    /// One byte of buffered input from the handle at `addr`, `None` at
+    /// EOF: the rest of [`Self::input_buf`] first when `addr` is the
+    /// current `Input()`, then the handle itself. Plain `Read` bypasses
+    /// the buffer, as it does on AmigaOS, so it uses [`Self::read`].
+    pub fn read_buffered_byte(&mut self, addr: u32) -> Result<Option<u8>, i32> {
+        if self.current_input == Some(addr) && self.input_pos < self.input_buf.len() {
+            self.input_pos += 1;
+            return Ok(Some(self.input_buf[self.input_pos - 1]));
+        }
+        Ok(self.read(addr, 1)?.first().copied())
     }
 
     /// `Read`: reads up to `len` bytes from the handle at `addr`,
@@ -2278,6 +2295,24 @@ mod tests {
         let dos = DosState::new(None);
         let err = dos.combine_lock_path(0x1234, "f.txt").unwrap_err();
         assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn buffered_reads_of_input_return_the_command_line_first() {
+        // RunCommand stuffs the arguments into the buffer of Input(), so
+        // FGetC(Input()) sees them before anything else; another handle
+        // does not.
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(None);
+        dos.input_buf = b"A\n".to_vec();
+        let input = dos.input_addr(&mut heap, &mut mem).unwrap();
+        let other = dos.alloc_file_handle(&mut heap, &mut mem, false).unwrap();
+
+        assert_eq!(dos.read_buffered_byte(other), Err(ERROR_INVALID_LOCK));
+        assert_eq!(dos.read_buffered_byte(input), Ok(Some(b'A')));
+        assert_eq!(dos.read_buffered_byte(input), Ok(Some(b'\n')));
+        assert_eq!(dos.input_pos, 2);
     }
 
     #[test]
