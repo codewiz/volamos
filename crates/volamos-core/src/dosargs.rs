@@ -36,9 +36,9 @@
 //!
 //! # Template syntax
 //!
-//! `NAME[=ABBREV][/mod[/mod...]],NAME2...` -- keywords comma-separated;
-//! each keyword optionally has a second name (order between the two
-//! doesn't matter: either can appear on the command line); modifiers
+//! `NAME[=ALIAS...][/mod[/mod...]],NAME2...` -- keywords comma-separated;
+//! each keyword optionally has more names (`HELP=--help=-h`; any of them
+//! can appear on the command line); modifiers
 //! (order-independent, at most one type-modifier per keyword): `/A`
 //! required, `/K` keyword-only (excluded from positional fill), `/S`
 //! switch, `/T` toggle, `/N` number, `/M` multiple strings (at most one
@@ -144,7 +144,7 @@ fn parse_template(template: &[u8]) -> Result<Vec<TemplateArg>, i32> {
             Vec::new()
         } else {
             let names: Vec<Vec<u8>> = name_part
-                .splitn(2, |&b| b == b'=')
+                .split(|&b| b == b'=')
                 .map(|n| n.to_ascii_uppercase())
                 .collect();
             if names.iter().any(|n| n.is_empty()) {
@@ -655,7 +655,7 @@ fn free_args_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 }
 
 /// The zero-based index of the template slot `keyword` names (matching
-/// either of a `NAME=ABBREV` slot's two names, per `FindArg`'s own NDK
+/// any of a `NAME=ABBREV` slot's names, per `FindArg`'s own NDK
 /// autodoc's "abbreviations are handled" -- the same `NAME=ABBREV`
 /// alias [`parse_template`] already recognizes for `ReadArgs`), or `-1`
 /// if `keyword` doesn't name any slot. A malformed template (one
@@ -1054,6 +1054,16 @@ mod tests {
         // and FindArg("a=b/k", "b") both name the same (only) slot, 0.
         assert_eq!(find_arg(b"a=b/k", b"a"), 0);
         assert_eq!(find_arg(b"a=b/k", b"b"), 0);
+    }
+
+    #[test]
+    fn find_arg_matches_every_name_of_a_slot_with_more_than_two() {
+        // p96cts and BenchWork spell their help switch HELP=--help=-h/S.
+        let template = b"BENCH/M,HELP=--help=-h/S";
+        assert_eq!(find_arg(template, b"help"), 1);
+        assert_eq!(find_arg(template, b"--help"), 1);
+        assert_eq!(find_arg(template, b"-h"), 1);
+        assert_eq!(find_arg(template, b"--help=-h"), -1);
     }
 
     #[test]
