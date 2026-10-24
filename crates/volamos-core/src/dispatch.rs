@@ -2197,15 +2197,17 @@ pub type TraceEvent = CallInfo;
 /// as `*"`, `*` as `**`, and a literal newline as `*n`, matching
 /// `crate::dosargs`'s own quoted-item decoder exactly) if it contains
 /// any character that would otherwise split it into multiple tokens or
-/// be misread (whitespace, `;`, `=`, `"`, `*`) or if it's empty (an
-/// empty *unquoted* item isn't a token at all). Left completely
-/// unchanged otherwise, so the overwhelming majority of ordinary,
-/// single-word arguments are unaffected.
+/// be misread (whitespace, `;`, `"`, `*`) or if it's empty (an empty
+/// *unquoted* item isn't a token at all). Left completely unchanged
+/// otherwise, so the overwhelming majority of ordinary, single-word
+/// arguments are unaffected. `=` alone does not quote: `KEY=value`
+/// typed into a shell is a keyword and its value, and a host argument
+/// spelled the same means the same.
 fn quote_arg_if_needed(arg: &str) -> String {
     let needs_quoting = arg.is_empty()
         || arg
             .chars()
-            .any(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '=' | '"' | '*'));
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '"' | '*'));
     if !needs_quoting {
         return arg.to_string();
     }
@@ -4621,6 +4623,13 @@ mod tests {
     fn quote_arg_if_needed_escapes_embedded_quotes_and_asterisks() {
         assert_eq!(quote_arg_if_needed(r#"say "hi""#), r#""say *"hi*"""#);
         assert_eq!(quote_arg_if_needed("a*b c"), "\"a**b c\"");
+    }
+
+    #[test]
+    fn quote_arg_if_needed_leaves_key_equals_value_for_readargs() {
+        // Quoted, ITER=0 would never match the ITER keyword.
+        assert_eq!(quote_arg_if_needed("ITER=0"), "ITER=0");
+        assert_eq!(quote_arg_if_needed("TO=a b"), "\"TO=a b\"");
     }
 
     #[test]
