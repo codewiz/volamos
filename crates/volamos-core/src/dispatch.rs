@@ -2767,11 +2767,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         // startup may read this instead of (or in addition to) A0/D0.
         mem.write_u32(task + exectask::PR_ARGUMENTS_OFFSET, args_addr);
 
-        // ReadArgs's default source (rdargs == NULL): the same
-        // command-line buffer just built above, per crate::dosargs's
-        // module docs. Registers hold this too, but a guest program is
-        // free to clobber A0/D0 before ever calling ReadArgs.
-        dos.cmdline = Some((args_addr, line_len));
+        // The same text in the Input() buffer, where ReadArgs reads it,
+        // as RunCommand puts it there on AmigaOS: see DosState::input_buf.
+        dos.input_buf = line.clone();
 
         Self {
             cpu,
@@ -4673,6 +4671,19 @@ mod tests {
             crate::guestmem::read_c_string(&rt.mem, pr_arguments),
             b"script.py \n"
         );
+    }
+
+    #[test]
+    fn the_command_line_is_also_in_the_input_buffer_for_readargs() {
+        // vbcc's startup code writes a NUL over the command line's '\n'
+        // as it splits the A0 buffer into argv; ReadArgs, reading the A0
+        // buffer, then saw "LIST\0" where the user typed LIST. It reads
+        // the Input() buffer now, as on AmigaOS.
+        let mut rt = runtime_with_program_and_args(&[RTS], vec!["LIST".to_string()]);
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let d0 = rt.cpu.data_register(DataRegister(0));
+        rt.mem.write_u8(a0 + d0 - 1, 0);
+        assert_eq!(rt.dos.input_buf, b"LIST \n");
     }
 
     #[test]

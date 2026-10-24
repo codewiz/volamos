@@ -25,13 +25,14 @@
 //! `FGetC` consults it before ever touching the host file, so a
 //! `FGetC`/`UnGetC`/`FGetC` sequence round-trips correctly.
 //!
+//! The other is the command line `RunCommand` stuffs into the buffer of
+//! `Input()` (`crate::dosfile::DosState::input_buf`): buffered reads of
+//! the current `Input()` return it before any host stdin, as they do on
+//! AmigaOS, where `ReadArgs` reads its arguments that way.
+//!
 //! `SelectInput`/`SelectOutput` (redirecting a *process's* default
-//! `Input()`/`Output()` handle) and interactive-file-specific behavior
-//! (`IsInteractive`, the BCPL command-line-parameters-in-the-input-
-//! buffer quirk `files.md` documents for `Input()`) are out of scope --
-//! this runtime's `Input()` is backed by real host stdin already (see
-//! `crate::dosfile`'s module docs), not a command-line buffer, so that
-//! particular real-AmigaOS quirk doesn't apply here in the first place.
+//! `Input()`/`Output()` handle) and other interactive-file-specific
+//! behavior (`IsInteractive`) are out of scope.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
@@ -54,9 +55,9 @@ fn fgetc(ctx: &mut HandlerContext<'_, impl Cpu>, addr: u32) -> i32 {
     let value = if let Some(pushed) = ctx.dos.ungetc_buf.remove(&addr) {
         pushed
     } else {
-        match ctx.dos.read(addr, 1) {
-            Ok(bytes) if !bytes.is_empty() => i32::from(bytes[0]),
-            Ok(_) => {
+        match ctx.dos.read_buffered_byte(addr) {
+            Ok(Some(byte)) => i32::from(byte),
+            Ok(None) => {
                 ctx.dos.set_io_err(0); // clean EOF, not an error
                 ENDSTREAMCH
             }
@@ -155,13 +156,12 @@ fn fread_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     let total_wanted = (block_len as u64) * (block_count as u64);
     let mut got = 0u64;
     while got < total_wanted {
-        match ctx.dos.read(addr, 1) {
-            Ok(bytes) if !bytes.is_empty() => {
-                ctx.mem
-                    .write_u8(buf_addr.wrapping_add(got as u32), bytes[0]);
+        match ctx.dos.read_buffered_byte(addr) {
+            Ok(Some(byte)) => {
+                ctx.mem.write_u8(buf_addr.wrapping_add(got as u32), byte);
                 got += 1;
             }
-            Ok(_) => break, // EOF
+            Ok(None) => break, // EOF
             Err(code) => {
                 ctx.dos.set_io_err(code);
                 break;

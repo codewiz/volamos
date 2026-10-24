@@ -6,15 +6,16 @@
 //!
 //! # Scope and deviations from real `ReadArgs`
 //!
-//! - **Default source only.** `rdargs == NULL` reads from
-//!   [`DosState::cmdline`] -- the same `A0`/`D0` command-line buffer
-//!   [`crate::dispatch::Runtime::new`] builds, exactly mirroring how real
-//!   AmigaOS delivers the CLI command tail through the process's buffered
-//!   `Input()`. [`DosState::cmdline_pos`] persists across calls, so
-//!   repeated `ReadArgs(NULL)` calls in one process walk forward through
-//!   the same buffer rather than each re-parsing it from the start --
-//!   real `ReadArgs(NULL)` shares this property because it reads off a
-//!   stateful buffered stream. A caller-supplied `rdargs` with its own
+//! - **Default source only.** `rdargs == NULL` reads the command line
+//!   `RunCommand` stuffed into the buffer of `Input()`,
+//!   [`DosState::input_buf`], as real `ReadArgs` "normally gets the
+//!   arguments by reading buffered IO from Input()" (autodoc). Reading
+//!   advances [`DosState::input_pos`], which buffered reads share, so
+//!   repeated `ReadArgs(NULL)` calls walk forward through the stream
+//!   rather than each re-parsing it from the start. Once that buffer is
+//!   used up, `ReadArgs` sees an empty line rather than waiting on host
+//!   stdin, as AROS does for an interactive `Input()` with an empty
+//!   buffer. A caller-supplied `rdargs` with its own
 //!   `RDA_Source` (a custom string to parse instead of the command line)
 //!   is not implemented: `rdargs` is accepted only as an *identity* for
 //!   `FreeArgs` bookkeeping (see below), and parsing still always reads
@@ -567,15 +568,10 @@ fn read_args(
 ) -> Result<u32, i32> {
     let template = parse_template(template_bytes)?;
 
-    let (cmdline_addr, cmdline_len) = dos.cmdline.unwrap_or((0, 0));
-    let mut buf = Vec::with_capacity(cmdline_len as usize);
-    for offset in 0..cmdline_len {
-        buf.push(mem.read_u8(cmdline_addr.wrapping_add(offset)));
-    }
-
-    let mut reader = Reader::new(&buf, dos.cmdline_pos as usize);
+    let buf = dos.input_buf.clone();
+    let mut reader = Reader::new(&buf, dos.input_pos);
     let result = match_args(&mut reader, &template);
-    dos.cmdline_pos = reader.pos as u32;
+    dos.input_pos = reader.pos;
 
     let slots = result?;
     let allocations = materialize(heap, mem, &template, slots, array_addr)?;
@@ -685,7 +681,7 @@ fn find_arg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// Registers `ReadArgs`/`FreeArgs` onto [`DOS_LIBRARY_BASE`], looked up
 /// by name through [`DOS_LVOS`]. Called from [`crate::dispatch::
 /// Runtime::new`] alongside the other `dos.library` registrations; these
-/// handlers need [`DosState::cmdline`] (always set by `Runtime::new`),
+/// handlers need [`DosState::input_buf`] (always set by `Runtime::new`),
 /// not a `Vfs`, so they work regardless of whether one is installed.
 pub fn register_dosargs_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
@@ -728,20 +724,16 @@ mod tests {
     use super::*;
     use crate::memory::FlatMemory;
 
-    /// Builds a fresh `(heap, mem, dos)` triple with `dos.cmdline`
-    /// pointing at `cmdline` (space-joined-and-newline-terminated, same
-    /// framing `Runtime::new` gives the real `A0`/`D0` buffer).
+    /// Builds a fresh `(heap, mem, dos)` triple with `cmdline` in
+    /// `dos.input_buf` (space-joined and newline-terminated, the framing
+    /// `Runtime::new` gives it).
     fn setup(cmdline: &[&str]) -> (GuestHeap, FlatMemory, DosState) {
-        let mut mem = FlatMemory::new(0x4000);
-        let mut heap = GuestHeap::new(0x100, 0x3000);
+        let mem = FlatMemory::new(0x4000);
+        let heap = GuestHeap::new(0x100, 0x3000);
         let mut line = cmdline.join(" ").into_bytes();
         line.push(b'\n');
-        let addr = heap.alloc(&mut mem, line.len() as u32).unwrap();
-        for (i, &b) in line.iter().enumerate() {
-            mem.write_u8(addr + i as u32, b);
-        }
         let mut dos = DosState::new(None);
-        dos.cmdline = Some((addr, line.len() as u32));
+        dos.input_buf = line;
         (heap, mem, dos)
     }
 
