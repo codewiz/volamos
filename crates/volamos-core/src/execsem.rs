@@ -1,5 +1,6 @@
 //! `exec.library`'s `struct SignalSemaphore` API: `InitSemaphore`/
-//! `ObtainSemaphore`/`ReleaseSemaphore`/`AttemptSemaphore`. Found needed
+//! `ObtainSemaphore`/`ReleaseSemaphore`/`AttemptSemaphore` and their
+//! `Shared` variants. Found needed
 //! running the real `AmiSnap` binary (`~/src/amisnap`), which uses a
 //! semaphore somewhere in its libnix-provided runtime support.
 //!
@@ -28,10 +29,21 @@
 //! faithful to the real function's contract.
 //!
 //! The waiter-queue side of the real algorithm (`ss_WaitQueue`,
-//! `ss_MultipleLink`, shared-vs-exclusive `SM_SHARED` locks,
-//! `ObtainSemaphoreShared`/`AttemptSemaphoreShared`) is consequently
+//! `ss_MultipleLink`, queued `SM_SHARED` requests) is consequently
 //! never exercised in this runtime and isn't implemented -- only the
 //! nesting/ownership bookkeeping a single task can actually observe.
+//!
+//! # Shared locks
+//!
+//! AROS's `ObtainSemaphoreShared`/`AttemptSemaphoreShared` run the same
+//! algorithm as their exclusive counterparts with a NULL owner: a free
+//! semaphore becomes shared (`ss_Owner` = NULL), and a shared one just
+//! nests. `ReleaseSemaphore` accepts a NULL owner. An exclusive
+//! `ObtainSemaphore` on a semaphore the task holds shared blocks forever
+//! on a real system, so it fails loudly here like any other contention.
+//! libpthread's `pthread_getspecific`, which libstdc++ calls on every
+//! `throw` when gcc is built with `--enable-threads=posix`, takes a
+//! shared lock.
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable};
@@ -109,39 +121,51 @@ fn init_semaphore_impl<M: AddressSpace>(mem: &mut M, sem: u32) {
 /// this module's docs). On `Err`, the speculative `ss_QueueCount`
 /// increment is undone first, so a caller that somehow recovers
 /// doesn't see permanently skewed bookkeeping.
-fn obtain_semaphore_impl<M: AddressSpace>(mem: &mut M, sem: u32, task: u32) -> Result<(), u32> {
+///
+/// `owner` is what a free semaphore's `ss_Owner` becomes, as in AROS's
+/// `InternalObtainSemaphore`: `task` for an exclusive lock, `0` for a
+/// shared one. A held semaphore nests if its owner is `task` or `owner`.
+fn obtain_semaphore_impl<M: AddressSpace>(
+    mem: &mut M,
+    sem: u32,
+    task: u32,
+    owner: u32,
+) -> Result<(), u32> {
     let queue_count = mem.read_u16(sem + SS_QUEUE_COUNT) as i16;
     let new_queue_count = queue_count.wrapping_add(1);
     mem.write_u16(sem + SS_QUEUE_COUNT, new_queue_count as u16);
 
     if new_queue_count == 0 {
         // Was free: we now own it.
-        mem.write_u32(sem + SS_OWNER, task);
+        mem.write_u32(sem + SS_OWNER, owner);
         let nest = mem.read_u16(sem + SS_NEST_COUNT);
         mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));
         return Ok(());
     }
 
-    let owner = mem.read_u32(sem + SS_OWNER);
-    if owner == task {
-        // Recursive obtain by the same (only) task: just nest.
+    let current_owner = mem.read_u32(sem + SS_OWNER);
+    if current_owner == task || current_owner == owner {
+        // Recursive obtain by the same (only) task, or another shared
+        // lock on a shared semaphore: just nest.
         let nest = mem.read_u16(sem + SS_NEST_COUNT);
         mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));
         return Ok(());
     }
 
     mem.write_u16(sem + SS_QUEUE_COUNT, queue_count as u16);
-    Err(owner)
+    Err(current_owner)
 }
 
 /// Shared release algorithm behind [`release_semaphore_handler`] and
 /// [`release_semaphore_list_handler`]: returns `Ok(())` on success, or
 /// `Err(owner)` -- the actual owner, which must differ from `task` --
 /// if this is an unmatched release (never obtained, already fully
-/// released, or a corrupt semaphore).
+/// released, or a corrupt semaphore). A shared semaphore (`ss_Owner` =
+/// NULL) is released by whoever holds it, as in AROS.
 fn release_semaphore_impl<M: AddressSpace>(mem: &mut M, sem: u32, task: u32) -> Result<(), u32> {
     let owner = mem.read_u32(sem + SS_OWNER);
-    if owner != task {
+    let free = mem.read_u16(sem + SS_QUEUE_COUNT) as i16 == -1;
+    if free || (owner != 0 && owner != task) {
         return Err(owner);
     }
 
@@ -167,15 +191,45 @@ fn obtain_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
-    obtain_semaphore_impl(ctx.mem, sem, task).map_err(|owner| DispatchError::HandlerFailed {
+    obtain_semaphore_impl(ctx.mem, sem, task, task).map_err(|owner| DispatchError::HandlerFailed {
         library: "exec.library".to_string(),
         lvo: -564,
         handler_name: "ObtainSemaphore".to_string(),
+        message: if owner == 0 {
+            format!(
+                "ObtainSemaphore({sem:#010x}) would block forever: the current task \
+                     {task:#010x} holds it shared, and an exclusive lock waits for every \
+                     shared one to be released"
+            )
+        } else {
+            format!(
+                "ObtainSemaphore({sem:#010x}) would block forever: already held by task \
+                     {owner:#010x}, not the current task {task:#010x} -- this is a \
+                     single-tasking runtime with no other task that could plausibly own it, \
+                     so the semaphore is either uninitialized or corrupt"
+            )
+        },
+    })
+}
+
+/// `ObtainSemaphoreShared` (LVO -678): `A0` = `struct SignalSemaphore*`.
+/// No return value. A free semaphore becomes shared (`ss_Owner` = NULL);
+/// a shared one, or one the current task holds exclusively, nests.
+fn obtain_semaphore_shared_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let sem = ctx.cpu.address_register(AddressRegister(0));
+    let task = ctx.current_task;
+
+    obtain_semaphore_impl(ctx.mem, sem, task, 0).map_err(|owner| DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo: -678,
+        handler_name: "ObtainSemaphoreShared".to_string(),
         message: format!(
-            "ObtainSemaphore({sem:#010x}) would block forever: already held by task \
-             {owner:#010x}, not the current task {task:#010x} -- this is a single-tasking \
-             runtime with no other task that could plausibly own it, so the semaphore is \
-             either uninitialized or corrupt"
+            "ObtainSemaphoreShared({sem:#010x}) would block forever: held exclusively by \
+                 task {owner:#010x}, not the current task {task:#010x} -- this is a \
+                 single-tasking runtime with no other task that could plausibly own it, so \
+                 the semaphore is either uninitialized or corrupt"
         ),
     })
 }
@@ -209,25 +263,23 @@ fn attempt_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
-    let queue_count = ctx.mem.read_u16(sem + SS_QUEUE_COUNT) as i16;
-    let new_queue_count = queue_count.wrapping_add(1);
-    ctx.mem
-        .write_u16(sem + SS_QUEUE_COUNT, new_queue_count as u16);
+    let obtained = obtain_semaphore_impl(ctx.mem, sem, task, task).is_ok();
+    ctx.cpu
+        .set_data_register(DataRegister(0), if obtained { 1 } else { 0 });
+    Ok(())
+}
 
-    let obtained = if new_queue_count == 0 {
-        ctx.mem.write_u32(sem + SS_OWNER, task);
-        let nest = ctx.mem.read_u16(sem + SS_NEST_COUNT);
-        ctx.mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));
-        true
-    } else if ctx.mem.read_u32(sem + SS_OWNER) == task {
-        let nest = ctx.mem.read_u16(sem + SS_NEST_COUNT);
-        ctx.mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));
-        true
-    } else {
-        ctx.mem.write_u16(sem + SS_QUEUE_COUNT, queue_count as u16);
-        false
-    };
+/// `AttemptSemaphoreShared` (LVO -720): `A0` = `struct SignalSemaphore*`.
+/// `D0` = `TRUE`/`FALSE`. As [`obtain_semaphore_shared_handler`], but
+/// returns `FALSE` instead of failing when another task holds the
+/// semaphore exclusively, as [`attempt_semaphore_handler`] does.
+fn attempt_semaphore_shared_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let sem = ctx.cpu.address_register(AddressRegister(0));
+    let task = ctx.current_task;
 
+    let obtained = obtain_semaphore_impl(ctx.mem, sem, task, 0).is_ok();
     ctx.cpu
         .set_data_register(DataRegister(0), if obtained { 1 } else { 0 });
     Ok(())
@@ -304,7 +356,7 @@ fn obtain_semaphore_list_handler<C: Cpu>(
         if succ == 0 {
             return Ok(());
         }
-        obtain_semaphore_impl(ctx.mem, node, task).map_err(|owner| {
+        obtain_semaphore_impl(ctx.mem, node, task, task).map_err(|owner| {
             DispatchError::HandlerFailed {
                 library: "exec.library".to_string(),
                 lvo: -582,
@@ -382,6 +434,14 @@ pub fn register_execsem_handlers<C: Cpu + 'static>(
     reg!("ObtainSemaphore", obtain_semaphore_handler::<C>);
     reg!("ReleaseSemaphore", release_semaphore_handler::<C>);
     reg!("AttemptSemaphore", attempt_semaphore_handler::<C>);
+    reg!(
+        "ObtainSemaphoreShared",
+        obtain_semaphore_shared_handler::<C>
+    );
+    reg!(
+        "AttemptSemaphoreShared",
+        attempt_semaphore_shared_handler::<C>
+    );
     reg!("FindSemaphore", find_semaphore_handler::<C>);
     reg!("AddSemaphore", add_semaphore_handler::<C>);
     reg!("RemSemaphore", rem_semaphore_handler::<C>);
@@ -596,6 +656,112 @@ mod tests {
                 assert_eq!(library, "exec.library");
                 assert_eq!(lvo, -570);
                 assert_eq!(handler_name, "ReleaseSemaphore");
+            }
+            other => panic!("expected HandlerFailed, got {other:?}"),
+        }
+    }
+
+    // --- ObtainSemaphoreShared/AttemptSemaphoreShared ---
+
+    /// `InitSemaphore` on `SEM_ADDR`, then each of `lvos` in turn, then
+    /// `rts`: `A0` stays `SEM_ADDR` throughout (every semaphore call
+    /// preserves it), and the last call's `D0` is the exit code.
+    fn sem_program(lvos: &[i32]) -> Vec<u16> {
+        let mut words = vec![move_imm_to_a(0), (SEM_ADDR >> 16) as u16, SEM_ADDR as u16];
+        words.extend_from_slice(&jsr_disp16_a6(-558)); // InitSemaphore
+        for &lvo in lvos {
+            words.extend_from_slice(&jsr_disp16_a6(lvo));
+        }
+        words.push(RTS);
+        words
+    }
+
+    #[test]
+    fn end_to_end_shared_obtain_leaves_no_owner_and_nests() {
+        // ObtainSemaphoreShared twice, ReleaseSemaphore once.
+        let mut rt = exec_program(&sem_program(&[-678, -678, -570]));
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u32(SEM_ADDR + SS_OWNER),
+            0,
+            "a shared lock has no owner"
+        );
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 1);
+        assert_eq!(
+            mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT) as i16,
+            0,
+            "still held"
+        );
+    }
+
+    #[test]
+    fn end_to_end_shared_obtain_release_round_trip() {
+        let mut rt = exec_program(&sem_program(&[-678, -570]));
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 0);
+        assert_eq!(
+            mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT) as i16,
+            -1,
+            "free again"
+        );
+    }
+
+    #[test]
+    fn end_to_end_shared_obtain_nests_inside_an_exclusive_lock() {
+        // ObtainSemaphore, then ObtainSemaphoreShared by the same task.
+        let mut rt = exec_program(&sem_program(&[-564, -678]));
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), rt.current_task());
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 2);
+    }
+
+    #[test]
+    fn end_to_end_attempt_semaphore_shared_succeeds_when_free_or_shared() {
+        let mut rt = exec_program(&sem_program(&[-720, -720]));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 1,
+            "AttemptSemaphoreShared on a shared semaphore returns TRUE"
+        );
+        assert_eq!(rt.memory().read_u16(SEM_ADDR + SS_NEST_COUNT), 2);
+    }
+
+    #[test]
+    fn end_to_end_attempt_semaphore_fails_on_a_shared_lock() {
+        // ObtainSemaphoreShared, then AttemptSemaphore (exclusive).
+        let mut rt = exec_program(&sem_program(&[-678, -576]));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "an exclusive attempt on a shared semaphore returns FALSE"
+        );
+        assert_eq!(rt.memory().read_u16(SEM_ADDR + SS_NEST_COUNT), 1);
+    }
+
+    #[test]
+    fn exclusive_obtain_of_a_shared_lock_fails_loudly() {
+        // ObtainSemaphoreShared, then ObtainSemaphore: a deadlock on AmigaOS.
+        let mut rt = exec_program(&sem_program(&[-678, -564]));
+        let mut out = Vec::new();
+        let err = rt
+            .run(&mut out, None)
+            .expect_err("an exclusive obtain of a shared lock should fail");
+        match err {
+            crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
+                lvo,
+                handler_name,
+                ..
+            }) => {
+                assert_eq!(lvo, -564);
+                assert_eq!(handler_name, "ObtainSemaphore");
             }
             other => panic!("expected HandlerFailed, got {other:?}"),
         }
