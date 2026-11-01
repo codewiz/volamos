@@ -344,7 +344,7 @@ impl M68kCpu {
     /// default, via [`Self::new`]/[`Self::with_config`]) matches real
     /// 68060 hardware: the instructions a real 68060 removed from
     /// silicon -- most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/
-    /// FMOD/FSCALE/FINT/FGETEXP/FGETMAN/FSINCOS/...) plus a handful of
+    /// FMOD/FSCALE/FGETEXP/FGETMAN/FSINCOS/...) plus a handful of
     /// integer ops (MOVEP, CHK2/CMP2, misaligned CAS/CAS2, 64-bit
     /// MUL/DIV) -- take an "unimplemented instruction" exception instead
     /// of executing, exactly as on real silicon; a real AmigaOS machine
