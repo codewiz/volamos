@@ -334,6 +334,42 @@ pub fn is_m68000_clr_with_memory_destination(opcode: u16) -> bool {
     mode != 0b000
 }
 
+/// The effective address of a `MOVEM <ea>,<list>` (memory to registers)
+/// in the modes [`movem_to_registers`] reports. Only modes whose address
+/// can be computed from the address registers and the extension words
+/// alone are included -- enough for every compiler's register restore
+/// (`(sp)+`, `(An)`, `d16(An)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovemSource {
+    /// `(An)` or `(An)+`: the address is `An`.
+    Indirect(u8),
+    /// `d16(An)`: the displacement is the word after the register mask.
+    Displacement(u8),
+}
+
+/// `MOVEM.{w,l} <ea>,<list>` = `0100 1100 1s mmm rrr` (`0x4C80`-`0x4CFF`),
+/// with `s` (bit 6) set for long transfers, followed by the register mask.
+///
+/// On the 68000 and 68010, memory-to-register `MOVEM` reads one more word
+/// after the last register it loads, and discards it (the `m68k` crate's
+/// `exec_movem` models this). Returns the source and whether the
+/// transfers are long, for the sanitizer to excuse that read (see
+/// `ShadowMap::movem_dummy_read`); `None` for any other opcode and for
+/// the modes [`MovemSource`] leaves out (indexed, absolute and
+/// PC-relative), where the read is then not excused.
+pub fn movem_to_registers(opcode: u16) -> Option<(MovemSource, bool)> {
+    if opcode & 0xFF80 != 0x4C80 {
+        return None;
+    }
+    let long = opcode & 0x0040 != 0;
+    let reg = (opcode & 0x7) as u8;
+    match (opcode >> 3) & 0x7 {
+        0b010 | 0b011 => Some((MovemSource::Indirect(reg), long)),
+        0b101 => Some((MovemSource::Displacement(reg), long)),
+        _ => None,
+    }
+}
+
 /// For a `BSR` opcode (as confirmed by [`classify`]), which of the
 /// three displacement encodings its low byte selects.
 ///
@@ -790,5 +826,38 @@ mod tests {
         assert!(!is_m68000_clr_with_memory_destination(0x4000)); // NEGX
         assert!(!is_m68000_clr_with_memory_destination(0x4400)); // NEG
         assert!(!is_m68000_clr_with_memory_destination(0x0000)); // ORI
+    }
+
+    // ---- movem_to_registers ----
+
+    #[test]
+    fn movem_to_registers_decodes_the_restore_modes() {
+        // movem.l (sp)+,d2-d7/a2-a6 -- gcc's epilogue.
+        assert_eq!(
+            movem_to_registers(0x4CDF),
+            Some((MovemSource::Indirect(7), true))
+        );
+        // movem.w (a0),d0-d1
+        assert_eq!(
+            movem_to_registers(0x4C90),
+            Some((MovemSource::Indirect(0), false))
+        );
+        // movem.l -8(a5),d2/a2 -- a frame-pointer epilogue.
+        assert_eq!(
+            movem_to_registers(0x4CED),
+            Some((MovemSource::Displacement(5), true))
+        );
+    }
+
+    #[test]
+    fn movem_to_registers_leaves_out_other_modes_and_opcodes() {
+        // movem.l d2-d7/a2-a6,-(sp): register to memory, no dummy read.
+        assert_eq!(movem_to_registers(0x48E7), None);
+        // movem.l 4(a0,d0.w),... (indexed), abs.l and d16(pc).
+        assert_eq!(movem_to_registers(0x4CF0), None);
+        assert_eq!(movem_to_registers(0x4CF9), None);
+        assert_eq!(movem_to_registers(0x4CFA), None);
+        // movem.l -(a0),...: not a valid memory-to-register mode.
+        assert_eq!(movem_to_registers(0x4CE0), None);
     }
 }
