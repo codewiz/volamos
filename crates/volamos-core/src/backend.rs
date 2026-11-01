@@ -495,6 +495,29 @@ impl M68kCpu {
             shadow.set_clr_dummy_read_pending(true);
         }
 
+        // Likewise, a 68000/68010 `MOVEM <ea>,<list>` reads one word past
+        // its last register and discards it. In an epilogue's
+        // `movem.l (sp)+,...` that word is the frame's first local, often
+        // never written. See `ShadowMap::movem_dummy_read`'s doc.
+        if matches!(self.core.cpu_type, CpuType::M68000 | CpuType::M68010)
+            && let Some((source, long)) = m68kops::movem_to_registers(opcode)
+        {
+            let mask = mem.peek_u16(pc.wrapping_add(2));
+            let base = match source {
+                m68kops::MovemSource::Indirect(reg) => self.address_register(AddressRegister(reg)),
+                m68kops::MovemSource::Displacement(reg) => {
+                    let d16 = mem.peek_u16(pc.wrapping_add(4)) as i16;
+                    self.address_register(AddressRegister(reg))
+                        .wrapping_add(d16 as u32)
+                }
+            };
+            let size = if long { 4 } else { 2 };
+            let dummy = base.wrapping_add(mask.count_ones() * size);
+            if let Some(shadow) = mem.shadow_mut() {
+                shadow.set_movem_dummy_read(Some(dummy));
+            }
+        }
+
         // Where the return address sits relative to A7 differs per
         // instruction, and getting it wrong would compare the wrong
         // bytes and invent corruption reports:
@@ -545,6 +568,7 @@ impl M68kCpu {
 
         if let Some(shadow) = mem.shadow_mut() {
             shadow.set_clr_dummy_read_pending(false);
+            shadow.set_movem_dummy_read(None);
         }
 
         let sp = self.address_register(AddressRegister(7));
@@ -1058,6 +1082,62 @@ mod tests {
                     && v.reason == Some(crate::sanitize::PoisonReason::Freed)),
             "CLR through a freed pointer must still report its read: {:#?}",
             shadow.violations()
+        );
+    }
+
+    /// Runs `movem.l (a0)+,d0-d1` on a 68000 over 8 bytes at 0x2000 that
+    /// `prepare` marks, and returns the violations it reports.
+    fn movem_restore_violations(
+        prepare: impl FnOnce(&mut crate::sanitize::ShadowMap),
+    ) -> Vec<crate::sanitize::Violation> {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let start = cpu.pc();
+        // 0x4CD8 0x0003: MOVEM.L (A0)+,D0-D1
+        load_words(&mut mem, start, &[0x4CD8, 0x0003]);
+        cpu.set_address_register(AddressRegister(0), 0x2000);
+        mem.write_u32(0x2000, 0x1122_3344);
+        mem.write_u32(0x2004, 0x5566_7788);
+
+        mem.enable_sanitizer();
+        let shadow = mem.shadow_mut().unwrap();
+        shadow.report_uninit = true;
+        prepare(shadow);
+
+        assert_eq!(cpu.step(&mut mem), StopReason::Step);
+        assert_eq!(cpu.data_register(DataRegister(1)), 0x5566_7788);
+        mem.shadow().unwrap().violations().to_vec()
+    }
+
+    #[test]
+    fn movem_dummy_read_of_uninit_memory_is_not_reported() {
+        // The word after the last register is the 68000's discarded
+        // dummy read: an Uninit word there is not a bug.
+        let violations = movem_restore_violations(|s| s.mark_uninit(0x2008, 2));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn movem_register_load_of_uninit_memory_still_reports() {
+        // Only the dummy word is excused, not the registers' own loads.
+        let violations = movem_restore_violations(|s| s.mark_uninit(0x2004, 2));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == crate::sanitize::ViolationKind::UninitRead),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn movem_dummy_read_of_freed_memory_still_reports() {
+        let violations = movem_restore_violations(|s| {
+            s.mark_unaddressable(0x2008, 2, crate::sanitize::PoisonReason::Freed)
+        });
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == crate::sanitize::ViolationKind::InvalidRead),
+            "{violations:#?}"
         );
     }
 

@@ -750,6 +750,16 @@ pub struct ShadowMap {
     /// run loop sets/clears it from [`Self::set_clr_dummy_read_pending`]
     /// (`&self`), matching [`Self::check_read`]'s own signature.
     clr_dummy_read_pending: Cell<bool>,
+    /// The address of the word a 68000/68010 `MOVEM <ea>,<list>` reads
+    /// and discards after its last register, set by the run loop for the
+    /// duration of that one instruction (see
+    /// [`Self::set_movem_dummy_read`]). In a register restore that word
+    /// is usually the first local of the function's frame, often never
+    /// written, so without this every such epilogue reports. Unlike
+    /// [`Self::clr_dummy_read_pending`], it excuses only those two bytes:
+    /// the registers' own loads from `Uninit` memory still report, as
+    /// does an `Unaddressable` dummy word.
+    movem_dummy_read: Cell<Option<u32>>,
 }
 
 impl ShadowMap {
@@ -768,6 +778,7 @@ impl ShadowMap {
             dropped_call_frames: 0,
             ignored_pcs: HashSet::new(),
             clr_dummy_read_pending: Cell::new(false),
+            movem_dummy_read: Cell::new(None),
         }
     }
 
@@ -780,6 +791,22 @@ impl ShadowMap {
     /// set `true`), so the exemption can never leak into the next one.
     pub(crate) fn set_clr_dummy_read_pending(&self, pending: bool) {
         self.clr_dummy_read_pending.set(pending);
+    }
+
+    /// Sets (or clears, with `None`) the address of the `MOVEM` dummy
+    /// word for the single instruction about to execute -- see
+    /// [`Self::movem_dummy_read`]'s doc. Same contract as
+    /// [`Self::set_clr_dummy_read_pending`]: the run loop clears it after
+    /// every instruction.
+    pub(crate) fn set_movem_dummy_read(&self, addr: Option<u32>) {
+        self.movem_dummy_read.set(addr);
+    }
+
+    /// Whether `addr` is a byte of the `MOVEM` dummy word.
+    fn is_movem_dummy_read(&self, addr: u32) -> bool {
+        self.movem_dummy_read
+            .get()
+            .is_some_and(|dummy| addr.wrapping_sub(dummy) < 2)
     }
 
     /// The number of guest bytes this map covers.
@@ -1092,7 +1119,11 @@ impl ShadowMap {
                 }
                 self.record(addr, size, ViolationKind::InvalidRead, reason)
             }
-            ShadowState::Uninit if self.report_uninit && !self.clr_dummy_read_pending.get() => {
+            ShadowState::Uninit
+                if self.report_uninit
+                    && !self.clr_dummy_read_pending.get()
+                    && !self.is_movem_dummy_read(addr) =>
+            {
                 self.record(addr, size, ViolationKind::UninitRead, None)
             }
             ShadowState::Uninit | ShadowState::Valid => false,
