@@ -186,11 +186,33 @@ fn ffp_max_magnitude(sign: u32) -> u32 {
     (0x00FF_FFFFu32 << 8) | (sign << 7) | 127
 }
 
+/// `IEEEDPFix`/`IEEESPFix`'s conversion: `y` truncated toward zero, and
+/// anything out of range -- infinities and NaNs too -- saturated by its
+/// sign bit, to `$7FFFFFFF` or `$80000000`. Rust's `as i32` saturates
+/// the infinities the same way but turns a NaN into 0, while the real
+/// libraries look only at the exponent and the sign: a NaN with the sign
+/// bit clear gives `$7FFFFFFF` (seen on a 68000 with Kickstart 3.1's
+/// `mathieeedoubbas.library`, and the same in AROS's `IEEEDPFix` and
+/// `IEEESPFix`).
+fn ieee_fix(y: f64) -> i32 {
+    if y.is_nan() {
+        if y.is_sign_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    } else {
+        y as i32
+    }
+}
+
 /// `mathieeedoubbas.library`'s `IEEEDPFix` (LVO -30: `D0/D1` = `double`
-/// `y`). `D0` = `y` truncated toward zero to a 32-bit integer.
+/// `y`). `D0` = `y` truncated toward zero to a 32-bit integer, see
+/// [`ieee_fix`].
 fn ieeedp_fix_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let y = read_f64(ctx.cpu, 0);
-    ctx.cpu.set_data_register(DataRegister(0), y as i32 as u32);
+    ctx.cpu
+        .set_data_register(DataRegister(0), ieee_fix(y) as u32);
     Ok(())
 }
 
@@ -366,10 +388,11 @@ fn register_mathieeedoubbas_handlers<C: Cpu + 'static>(
 }
 
 /// `mathieeesingbas.library`'s `IEEESPFix` (LVO -30: `D0` = single `y`).
-/// `D0` = `y` truncated toward zero to a 32-bit integer.
+/// `D0` = `y` truncated toward zero to a 32-bit integer, see [`ieee_fix`].
 fn ieeesp_fix_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu.set_data_register(DataRegister(0), y as i32 as u32);
+    ctx.cpu
+        .set_data_register(DataRegister(0), ieee_fix(f64::from(y)) as u32);
     Ok(())
 }
 
@@ -1117,6 +1140,20 @@ pub fn register_mathlibs_handlers<C: Cpu + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ieee_fix_truncates_and_saturates_by_sign() {
+        assert_eq!(ieee_fix(2.9), 2);
+        assert_eq!(ieee_fix(-2.9), -2);
+        assert_eq!(ieee_fix(1e10), i32::MAX);
+        assert_eq!(ieee_fix(-1e10), i32::MIN);
+        assert_eq!(ieee_fix(f64::INFINITY), i32::MAX);
+        assert_eq!(ieee_fix(f64::NEG_INFINITY), i32::MIN);
+        // A NaN saturates by its sign bit too, not to 0 as `as i32` does.
+        assert_eq!(ieee_fix(f64::NAN), i32::MAX);
+        assert_eq!(ieee_fix(-f64::NAN), i32::MIN);
+        assert_eq!(ieee_fix(f64::from(f32::NAN)), i32::MAX);
+    }
 
     #[test]
     fn ffp_round_trips_common_values() {
