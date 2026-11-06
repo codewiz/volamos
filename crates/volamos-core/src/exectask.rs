@@ -929,12 +929,23 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// task (whichever one just `rts`'d into this stub) is gone -- see
 /// [`crate::taskswitch::TaskScheduler::terminate_current`]'s doc for
 /// what that does and doesn't clean up.
+///
+/// If no other task is ready, a pending timer request may still wake
+/// one, so it is fired early, as [`wait_handler`] does when every task
+/// is blocked: a task that ends while the only other one waits on a
+/// timer (a joined thread whose joiner then does a timed condition
+/// wait) is not a deadlock.
 pub(crate) fn task_exit_stub_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
-    ctx.tasks
-        .terminate_current(ctx.mem)
-        .map_err(|_| DispatchError::TaskDeadlock)
+    loop {
+        if ctx.tasks.terminate_current(ctx.mem).is_ok() {
+            return Ok(());
+        }
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            return Err(DispatchError::TaskDeadlock);
+        }
+    }
 }
 
 /// `FindTask` (LVO -294): `A1` = task name, or `NULL` for the current
