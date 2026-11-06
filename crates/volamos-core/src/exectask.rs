@@ -399,6 +399,23 @@ pub const PR_RETURNADDR_OFFSET: u32 = 176;
 /// called once from `crates/volamos/src/main.rs` after `set_vfs`).
 /// Found needed running the real SAS/C `sc` compiler (issue #17).
 pub const PR_HOMEDIR_OFFSET: u32 = 188;
+/// `pr_WindowPtr`: `APTR`, offset 184 (`pr_PktWait` 180 + 4). The window
+/// DOS puts its requesters on; `-1` means none.
+pub const PR_WINDOW_PTR_OFFSET: u32 = 184;
+/// `pr_Flags`: `LONG`, offset 192 (`pr_HomeDir` 188 + 4). DOS's own flags
+/// for the process: the `PRF_CLOSE*` bits say which standard handles it
+/// closes when the process ends.
+pub const PR_FLAGS_OFFSET: u32 = 192;
+/// `pr_CES`: `BPTR`, offset 224 (`pr_LocalVars`, a 12-byte `struct
+/// MinList`, at 208, then `pr_ShellPrivate` 220). The error stream, or
+/// `0` to use `pr_COS`.
+pub const PR_CES_OFFSET: u32 = 224;
+/// `PRF_CLOSEINPUT`, per `<dos/dosextens.h>`: close `pr_CIS` at exit.
+pub const PRF_CLOSEINPUT: u32 = 1 << 3;
+/// `PRF_CLOSEOUTPUT`: close `pr_COS` at exit.
+pub const PRF_CLOSEOUTPUT: u32 = 1 << 4;
+/// `PRF_CLOSEERROR`: close `pr_CES` at exit.
+pub const PRF_CLOSEERROR: u32 = 1 << 6;
 /// `pr_Arguments`: `STRPTR`, offset 204 (`pr_HomeDir` 188 + 4, `pr_Flags`
 /// 192, `pr_ExitCode` 196, `pr_ExitData` 200, `pr_Arguments` 204). Per
 /// `<dos/dosextens.h>`: "Arguments passed to the process at start".
@@ -756,6 +773,22 @@ const NP_DUMMY: u32 = TAG_USER + 1000;
 /// (the other, mutually exclusive way real `CreateNewProc` accepts)
 /// isn't supported.
 const NP_ENTRY: u32 = NP_DUMMY + 3;
+/// `NP_Input` (`NP_Dummy + 4`): `pr_CIS`, stored as given. Default: a
+/// new `NIL:` handle.
+const NP_INPUT: u32 = NP_DUMMY + 4;
+/// `NP_Output` (`NP_Dummy + 5`): `pr_COS`, as `NP_Input`.
+const NP_OUTPUT: u32 = NP_DUMMY + 5;
+/// `NP_CloseInput` (`NP_Dummy + 6`): close `pr_CIS` at exit. Default
+/// TRUE.
+const NP_CLOSEINPUT: u32 = NP_DUMMY + 6;
+/// `NP_CloseOutput` (`NP_Dummy + 7`): close `pr_COS` at exit. Default
+/// TRUE.
+const NP_CLOSEOUTPUT: u32 = NP_DUMMY + 7;
+/// `NP_Error` (`NP_Dummy + 8`): `pr_CES`. Default `0`.
+const NP_ERROR: u32 = NP_DUMMY + 8;
+/// `NP_CloseError` (`NP_Dummy + 9`): close `pr_CES` at exit. Default
+/// FALSE.
+const NP_CLOSEERROR: u32 = NP_DUMMY + 9;
 /// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
 const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
@@ -763,6 +796,15 @@ const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 const NP_NAME: u32 = NP_DUMMY + 12;
 /// `NP_Priority` (`NP_Dummy + 13`).
 const NP_PRIORITY: u32 = NP_DUMMY + 13;
+/// `NP_ConsoleTask` (`NP_Dummy + 14`): `pr_ConsoleTask`. Default: the
+/// parent's.
+const NP_CONSOLETASK: u32 = NP_DUMMY + 14;
+/// `NP_WindowPtr` (`NP_Dummy + 15`): `pr_WindowPtr`. Default: the
+/// parent's.
+const NP_WINDOWPTR: u32 = NP_DUMMY + 15;
+/// `NP_Arguments` (`NP_Dummy + 21`): a C string, copied, that the entry
+/// point gets in `A0` with its length in `D0`, and `pr_Arguments`.
+const NP_ARGUMENTS: u32 = NP_DUMMY + 21;
 
 /// Real `CreateNewProc`'s documented default `NP_StackSize`: 4000
 /// bytes.
@@ -773,15 +815,9 @@ const DEFAULT_NP_NAME: &str = "New Process";
 /// Builds a minimal `struct Process`/`struct Task` for a
 /// `dos.library/CreateNewProc` child task (issue #121) -- the same
 /// struct-`Process` layout [`create_current_task`] builds for the main
-/// task, but *not* its CLI-process fields: `pr_CIS`/`pr_COS`/
-/// `pr_ConsoleTask`/`pr_CLI` all stay `NULL`/zeroed. A real
-/// `CreateNewProc` caller that doesn't supply `NP_Input`/`NP_Output`
-/// gets real `Open("NIL:", ...)` handles for those on real AmigaOS;
-/// this runtime doesn't implement that, so they're left `NULL` instead
-/// of a silently wrong answer -- a documented simplification, not a
-/// forgotten field, since nothing [`create_new_proc_handler`] actually
-/// needs to support touches them (see its own doc for the exact
-/// scope).
+/// task, but *not* its CLI-process fields: `pr_CLI` stays `NULL`.
+/// [`create_new_proc_handler`] fills in the standard handles,
+/// `pr_ConsoleTask` and `pr_WindowPtr` from its tags.
 ///
 /// Returns `None` (rather than panicking, unlike [`create_current_task`]
 /// -- which only ever runs once, at [`crate::dispatch::Runtime::new`]
@@ -818,32 +854,47 @@ fn create_task<M: AddressSpace>(
     Some(task)
 }
 
+/// The `ti_Data` of tag `id` in the tag list at `tags`, if it is there.
+fn tag_data<M: AddressSpace>(mem: &M, tags: u32, id: u32) -> Option<u32> {
+    let item = crate::utility::find_tag_item_impl(mem, id, tags);
+    (item != 0).then(|| mem.read_u32(item + 4))
+}
+
+/// A new `NIL:` handle's `BPTR` for a child's standard handle, or `0`.
+fn open_nil<C: Cpu>(ctx: &mut HandlerContext<'_, C>, mode: i32) -> u32 {
+    ctx.dos.open(ctx.heap, ctx.mem, "NIL:", mode).unwrap_or(0)
+}
+
 /// `dos.library`'s `CreateNewProc` (LVO -498: `D1` = tag list). `D0` =
 /// the new `struct Process*`, or `NULL` on failure -- see issue #121
 /// and `crate::taskswitch`'s module doc for the scheduling this plugs
 /// a new task into.
 ///
-/// Scope: only `NP_Entry` (required)/`NP_StackSize`/`NP_Name`/
-/// `NP_Priority` are read. `NP_Seglist` -- the other, mutually
+/// Scope: `NP_Entry` (required), `NP_StackSize`, `NP_Name`,
+/// `NP_Priority`, the standard handles (`NP_Input`/`NP_Output`/
+/// `NP_Error` and their `NP_Close*` flags, which [`task_exit_stub_handler`]
+/// acts on), `NP_ConsoleTask`, `NP_WindowPtr` and `NP_Arguments`, with
+/// the defaults `<dos/dostags.h>` documents. The handles are stored as
+/// given, unchecked, as real DOS does: libpthread passes a thread's
+/// slot number in `NP_Input` and reads it back from `pr_CIS`.
+/// `NP_CurrentDir`/`NP_HomeDir` are not read, since this runtime has
+/// one current directory for the whole run, not one per process.
+/// `NP_Seglist` -- the other, mutually
 /// exclusive way real `CreateNewProc` accepts what to run (a seglist,
 /// as from `LoadSeg`, rather than a bare function pointer) -- isn't
 /// supported; every known caller that actually needs this runtime's
 /// `CreateNewProc` support (both the libpthread and native toolchain
 /// thread models, per issue #121's thread) always supplies `NP_Entry`.
-/// Every other tag (`NP_Input`/`NP_Output`/`NP_CurrentDir`/`NP_HomeDir`/
-/// `NP_Cli`/...) is silently ignored -- see [`create_task`]'s doc for
-/// why that's a documented simplification rather than a silent wrong
-/// answer.
+/// The remaining tags (`NP_Cli`/`NP_Path`/`NP_CopyVars`/...) are
+/// ignored.
 ///
 /// The child's initial registers: `A7` = the top of its own freshly
 /// allocated stack (with [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
 /// pre-pushed as the return address for its outermost `rts`, exactly
 /// the way [`crate::dispatch::Runtime::new`] pre-pushes `EXIT_STUB_ADDR`
-/// for the main task's own outermost `rts`), `PC` = `NP_Entry`, every
-/// other register zeroed -- real `CreateNewProc`'s autodoc documents
-/// no argument-passing convention for the entry routine (unlike a
-/// normal program's `A0`/`D0` argv/argc), so there is nothing else to
-/// seed.
+/// for the main task's own outermost `rts`), `PC` = `NP_Entry`, `A0`/`D0`
+/// = the `NP_Arguments` copy and its length (`0`/`0` without one), every
+/// other register zeroed.
 fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let tags = ctx.cpu.data_register(DataRegister(1));
 
@@ -889,6 +940,21 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         }
     };
 
+    // NP_Arguments: copied, as real DOS does, and then the caller's own
+    // string may go away.
+    let (args, args_len) = match tag_data(ctx.mem, tags, NP_ARGUMENTS) {
+        Some(ptr) if ptr != 0 => {
+            let bytes = crate::guestmem::read_c_string(ctx.mem, ptr);
+            let Ok(copy) = ctx.heap.alloc(ctx.mem, bytes.len() as u32 + 1) else {
+                ctx.cpu.set_data_register(DataRegister(0), 0);
+                return Ok(());
+            };
+            write_c_string(ctx.mem, copy, &bytes);
+            (copy, bytes.len() as u32)
+        }
+        _ => (0, 0),
+    };
+
     let Ok(stack_block) = ctx.heap.alloc(ctx.mem, stack_size) else {
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
@@ -902,10 +968,47 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     };
 
+    // The standard handles, as given or a NIL: of the child's own, and
+    // which of them DOS closes at exit (see task_exit_stub_handler).
+    let input = match tag_data(ctx.mem, tags, NP_INPUT) {
+        Some(bptr) => bptr,
+        None => open_nil(ctx, crate::dosfile::MODE_OLDFILE),
+    };
+    let output = match tag_data(ctx.mem, tags, NP_OUTPUT) {
+        Some(bptr) => bptr,
+        None => open_nil(ctx, crate::dosfile::MODE_NEWFILE),
+    };
+    let error = tag_data(ctx.mem, tags, NP_ERROR).unwrap_or(0);
+    let mut flags = 0;
+    if tag_data(ctx.mem, tags, NP_CLOSEINPUT).is_none_or(|v| v != 0) {
+        flags |= PRF_CLOSEINPUT;
+    }
+    if tag_data(ctx.mem, tags, NP_CLOSEOUTPUT).is_none_or(|v| v != 0) {
+        flags |= PRF_CLOSEOUTPUT;
+    }
+    if tag_data(ctx.mem, tags, NP_CLOSEERROR).is_some_and(|v| v != 0) {
+        flags |= PRF_CLOSEERROR;
+    }
+    let parent = ctx.current_task;
+    let console = tag_data(ctx.mem, tags, NP_CONSOLETASK)
+        .unwrap_or_else(|| ctx.mem.read_u32(parent + PR_CONSOLE_TASK_OFFSET));
+    let window = tag_data(ctx.mem, tags, NP_WINDOWPTR)
+        .unwrap_or_else(|| ctx.mem.read_u32(parent + PR_WINDOW_PTR_OFFSET));
+    ctx.mem.write_u32(task + PR_CIS_OFFSET, input);
+    ctx.mem.write_u32(task + PR_COS_OFFSET, output);
+    ctx.mem.write_u32(task + PR_CES_OFFSET, error);
+    ctx.mem.write_u32(task + PR_FLAGS_OFFSET, flags);
+    ctx.mem.write_u32(task + PR_CONSOLE_TASK_OFFSET, console);
+    ctx.mem.write_u32(task + PR_WINDOW_PTR_OFFSET, window);
+    ctx.mem.write_u32(task + PR_ARGUMENTS_OFFSET, args);
+
     let mut a = [0u32; 8];
+    a[0] = args;
     a[7] = sp;
+    let mut d = [0u32; 8];
+    d[0] = args_len;
     let snapshot = crate::cpu::RegisterSnapshot {
-        d: [0; 8],
+        d,
         a,
         pc: entry,
         // The parent's own current SR, not a hardcoded value: this
@@ -929,12 +1032,42 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// task (whichever one just `rts`'d into this stub) is gone -- see
 /// [`crate::taskswitch::TaskScheduler::terminate_current`]'s doc for
 /// what that does and doesn't clean up.
+///
+/// If no other task is ready, a pending timer request may still wake
+/// one, so it is fired early, as [`wait_handler`] does when every task
+/// is blocked: a task that ends while the only other one waits on a
+/// timer (a joined thread whose joiner then does a timed condition
+/// wait) is not a deadlock.
+///
+/// First, as real DOS does, the standard handles that the process's
+/// `pr_Flags` say to close (`NP_CloseInput`/`NP_CloseOutput`/
+/// `NP_CloseError`) are closed: whatever `pr_CIS`/`pr_COS`/`pr_CES`
+/// hold by now, which is why libpthread clears `pr_CIS` once it has
+/// read its slot number from it.
 pub(crate) fn task_exit_stub_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
-    ctx.tasks
-        .terminate_current(ctx.mem)
-        .map_err(|_| DispatchError::TaskDeadlock)
+    let task = ctx.current_task;
+    let flags = ctx.mem.read_u32(task + PR_FLAGS_OFFSET);
+    for (flag, offset) in [
+        (PRF_CLOSEINPUT, PR_CIS_OFFSET),
+        (PRF_CLOSEOUTPUT, PR_COS_OFFSET),
+        (PRF_CLOSEERROR, PR_CES_OFFSET),
+    ] {
+        let bptr = ctx.mem.read_u32(task + offset);
+        if flags & flag != 0 && bptr != 0 {
+            ctx.dos
+                .close(ctx.heap, crate::guestmem::addr_from_bptr(bptr));
+        }
+    }
+    loop {
+        if ctx.tasks.terminate_current(ctx.mem).is_ok() {
+            return Ok(());
+        }
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            return Err(DispatchError::TaskDeadlock);
+        }
+    }
 }
 
 /// `FindTask` (LVO -294): `A1` = task name, or `NULL` for the current
@@ -2908,6 +3041,107 @@ mod tests {
             "the parent should read the marker only the child task's own \
              code could have written, proving the child actually ran"
         );
+    }
+
+    #[test]
+    fn create_new_proc_child_input_is_np_input_as_given() {
+        // As the test above, but the child stores what Input() returns:
+        // NP_Input's value, unchecked, as real DOS stores it in pr_CIS
+        // (libpthread passes a thread's slot number there). The child
+        // exits with the default NP_CloseInput, so the exit path also
+        // closes that non-handle, harmlessly.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); Wait(SIGNAL); read marker ---
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS);
+
+        // --- child: *marker = Input(); Signal(parent, join signal) ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // Input
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        let parent_task_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [NP_INPUT, 0x1234], [TAG_DONE, 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, NP_INPUT);
+        mem.write_u32(tags_addr + 12, 0x1234);
+        mem.write_u32(tags_addr + 16, 0);
+        mem.write_u32(tags_addr + 20, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        let parent_task_patch_addr = entry + (parent_task_imm_idx as u32) * 2 + 2;
+        rt.memory_mut()
+            .write_u32(parent_task_patch_addr, parent_task);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0x1234, "the child's Input() should be NP_Input");
     }
 
     #[test]
