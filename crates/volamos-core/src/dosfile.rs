@@ -1495,8 +1495,16 @@ fn unlock_records_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
 
 /// `Input()`. `D0` = BPTR of the default input handle (or 0 on the
 /// extremely unlikely guest-heap-exhaustion failure, with `IoErr()`
-/// set).
+/// set). A process that `CreateNewProc` started gets its own `pr_CIS`
+/// instead, as on AmigaOS, where `Input()` just returns that field.
 fn input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    if !ctx.tasks.is_main(ctx.current_task) {
+        let bptr = ctx
+            .mem
+            .read_u32(ctx.current_task + crate::exectask::PR_CIS_OFFSET);
+        ctx.cpu.set_data_register(DataRegister(0), bptr);
+        return Ok(());
+    }
     match ctx.dos.input_addr(ctx.heap, ctx.mem) {
         Ok(addr) => ctx
             .cpu
@@ -1509,8 +1517,16 @@ fn input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     Ok(())
 }
 
-/// `Output()`. As [`input_handler`], for the default output handle.
+/// `Output()`. As [`input_handler`], for the default output handle and
+/// `pr_COS`.
 fn output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    if !ctx.tasks.is_main(ctx.current_task) {
+        let bptr = ctx
+            .mem
+            .read_u32(ctx.current_task + crate::exectask::PR_COS_OFFSET);
+        ctx.cpu.set_data_register(DataRegister(0), bptr);
+        return Ok(());
+    }
     match ctx.dos.output_addr(ctx.heap, ctx.mem) {
         Ok(addr) => ctx
             .cpu

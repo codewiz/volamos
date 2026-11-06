@@ -161,6 +161,8 @@ pub struct Deadlock;
 /// remember *which* equal-priority task ran last, which nothing here
 /// currently needs).
 pub struct TaskScheduler {
+    /// The program's own task, the one [`Self::new`] started with.
+    main: u32,
     current: u32,
     others: BTreeMap<u32, TaskRecord>,
     /// Set by a successful [`Self::block_current_on_signal`]/[`Self::
@@ -188,6 +190,7 @@ impl TaskScheduler {
     /// task -- called once from [`crate::dispatch::Runtime::new`].
     pub fn new(main_task: u32) -> Self {
         Self {
+            main: main_task,
             current: main_task,
             others: BTreeMap::new(),
             pending_restore: None,
@@ -221,6 +224,12 @@ impl TaskScheduler {
     /// see *its* identity, not the task it's handing off to.
     pub fn current(&self) -> u32 {
         self.current
+    }
+
+    /// Whether `task` is the program's own task rather than one that
+    /// `CreateNewProc` started.
+    pub fn is_main(&self, task: u32) -> bool {
+        task == self.main
     }
 
     /// Whether a switch has been decided ([`Self::
