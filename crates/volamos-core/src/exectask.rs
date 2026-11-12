@@ -2057,10 +2057,10 @@ fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// successfully) fails with [`IOERR_NOCMD`] rather than panicking.
 /// Tracks `TR_ADDREQUEST` requests [`send_io_handler`] handed back
 /// immediately but which haven't reached their deadline yet (issue
-/// #237, sub-problem #2). `DoIO` stays a synchronous host sleep (see
-/// [`run_io_request`]'s doc) -- there's only ever one caller to block,
-/// so "queue and wait" and "sleep now" really are the same thing there
-/// -- but `SendIO` must return immediately, matching its documented
+/// #237, sub-problem #2). `DoIO` suspends only its caller until its
+/// deadline, as `Delay` does (see [`do_io_handler`]'s doc), through a
+/// `Delay` entry here rather than one of these -- but `SendIO` must
+/// return immediately, matching its documented
 /// asynchronous contract, which real pthread/newlib condvar-with-
 /// timeout code genuinely relies on: it `SendIO`s a `timerequest`, then
 /// `Wait()`s on a mask combining the condvar's signal with the timer's
@@ -2206,6 +2206,15 @@ impl PendingTimers {
         deadline
     }
 
+    /// Whether `task` has a `Delay` entry: whether its current
+    /// `Delay`, or synchronous `DoIO(TR_ADDREQUEST)`, is a re-trap
+    /// after blocking rather than a fresh call.
+    pub(crate) fn has_delay(&self, task: u32) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.completion == TimerCompletion::Delay(task))
+    }
+
     /// Removes `task`'s own `Delay` entry, if any, once its `Delay`
     /// call has genuinely finished (so a later, unrelated `Delay` call
     /// from the same task starts with a clean slate).
@@ -2300,8 +2309,9 @@ impl PendingTimers {
     /// safe here specifically *because* this is the last-resort path:
     /// by construction, nothing else could possibly make progress
     /// while this sleeps anyway (every other task is blocked, or there
-    /// never was another task) -- the same reasoning that already
-    /// makes [`do_io_handler`]'s synchronous sleep correct for `DoIO`.
+    /// never was another task), which is also the only time `Delay`
+    /// and a synchronous `DoIO` sleep the host for real
+    /// ([`crate::dosdate::block_current_for`]).
     pub(crate) fn fire_earliest<M: AddressSpace>(
         &mut self,
         mem: &mut M,
@@ -2440,43 +2450,48 @@ fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
             // as this runtime takes elsewhere.
             0
         }
-        TR_ADDREQUEST => {
-            // A (synchronous, since DoIO/SendIO both resolve
-            // immediately here) delay -- same host sleep
-            // crate::dosdate's Delay() uses, just from a timeval
-            // instead of a tick count.
-            let secs = mem.read_u32(ioreq + TR_TIME_SECS_OFFSET);
-            let micro = mem.read_u32(ioreq + TR_TIME_MICRO_OFFSET);
-            let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
-            std::thread::sleep(std::time::Duration::from_millis(millis));
-            0
-        }
+        // TR_ADDREQUEST never gets here: do_io_handler and
+        // send_io_handler wait for it, or queue it, before they call
+        // this, and a host sleep here would stall every task.
         _ => IOERR_NOCMD,
     }
 }
 
 /// `exec.library`'s `DoIO` (LVO -456: `A1` = `struct IORequest*`).
 /// `D0` = `io_Error` (also written into the request itself, matching
-/// real `DoIO`). Synchronous by construction here (this runtime is
-/// single-threaded, so "queue and wait" and "do it now" are the same
-/// thing) -- see [`run_io_request`] for the timer commands this
-/// answers for real. Found missing while running the real `PhxAss`
+/// real `DoIO`). Found missing while running the real `PhxAss`
 /// assembler.
+///
+/// A `timer.device` `TR_ADDREQUEST` waits for its request's reply, as
+/// real `DoIO` does: it suspends only the calling task, the way `Delay`
+/// does ([`crate::dosdate::block_current_for`]), so the other tasks run
+/// until its time is up -- to the microsecond, so a `sleep_for(100us)`
+/// loop gives them the CPU too. A request already due when it starts
+/// (`{0, 0}`, which code uses as a yield) still gives the other ready
+/// tasks a turn, as the timer's reply does on real hardware. Like
+/// `Delay`, this relies on those tasks reaching a library call
+/// eventually: this runtime doesn't preempt, so a task that busy-waits
+/// on memory without one keeps the CPU, and the `DoIO` caller only runs
+/// again once it traps. The other timer commands complete at once, in
+/// [`run_io_request`].
 fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
-        // Real DoIO waits for the request's reply, so the other tasks run
-        // in the meantime: suspend this one as Delay does, rather than
-        // sleeping the host thread with every task in it.
         let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
-        let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
-        if crate::dosdate::block_current_for(ctx, millis) {
+        let duration = std::time::Duration::from_secs(u64::from(secs))
+            + std::time::Duration::from_micros(u64::from(micro));
+        let retrap = ctx.timers.has_delay(ctx.current_task);
+        if crate::dosdate::block_current_for(ctx, duration) {
             return Ok(());
         }
         ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
         ctx.cpu.set_data_register(DataRegister(0), 0);
+        if !retrap {
+            // Due at once, without blocking: still a turn for the others.
+            ctx.tasks.request_yield();
+        }
         return Ok(());
     }
     let error = run_io_request(ctx.mem, ioreq);
@@ -2494,9 +2509,9 @@ fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 /// to defer. `TR_ADDREQUEST` (issue #237, sub-problem #2) is the one
 /// real asynchronous case: this registers it with [`PendingTimers`]
 /// and returns with the request genuinely still pending, instead of
-/// blocking this whole (single-threaded) runtime in a host sleep the
-/// way [`do_io_handler`]'s `DoIO` legitimately does -- see
-/// [`PendingTimers`]'s doc for why `SendIO` can't do that.
+/// suspending its caller until the deadline the way [`do_io_handler`]'s
+/// `DoIO` does -- see [`PendingTimers`]'s doc for why `SendIO` can't do
+/// that.
 fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
@@ -5578,6 +5593,27 @@ mod tests {
         // flat host sleep it starved every other task: libstdc++'s
         // std::this_thread::sleep_for sleeps through DoIO, so a thread
         // waiting that way for another one hung.
+        do_io_timer_request_runs_the_child(0, 100_000);
+    }
+
+    #[test]
+    fn a_sub_millisecond_do_io_timer_request_lets_another_task_run() {
+        // sleep_for(100us): rounding to whole milliseconds made it a
+        // zero wait that never switched.
+        do_io_timer_request_runs_the_child(0, 100);
+    }
+
+    #[test]
+    fn a_zero_do_io_timer_request_yields_to_another_ready_task() {
+        // {0, 0}, used as a yield: due at once, it still gives the
+        // ready child a turn before the parent goes on.
+        do_io_timer_request_runs_the_child(0, 0);
+    }
+
+    /// The parent creates a child that writes a marker, then calls
+    /// `DoIO(TR_ADDREQUEST)` for `secs`/`micro` and returns the marker:
+    /// the child must have run by the time `DoIO` returns.
+    fn do_io_timer_request_runs_the_child(secs: u32, micro: u32) {
         const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
 
         fn patch(words: &mut [u16], idx: usize, value: u32) {
@@ -5636,8 +5672,8 @@ mod tests {
         }
         mem.write_u32(ioreq_addr + IO_DEVICE_OFFSET, TIMER_DEVICE_BASE);
         mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
-        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
-        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 100_000);
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, secs);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, micro);
 
         let mut rt = Runtime::new(
             M68kCpu::new(),
@@ -5653,8 +5689,8 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(
             code, 0x2A,
-            "the child must have run and written the marker during the parent's DoIO, not \
-             been starved of the CPU by a flat host sleep"
+            "the child must have run and written the marker during the parent's \
+             DoIO({secs}s, {micro}us), not been starved of the CPU"
         );
         assert_eq!(rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET), 0);
     }
