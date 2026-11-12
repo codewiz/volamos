@@ -128,6 +128,18 @@ fn datestamp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ticks = ctx.cpu.data_register(DataRegister(1));
     let millis = u64::from(ticks) * 1000 / u64::from(TICKS_PER_SECOND);
+    block_current_for(ctx, millis);
+    Ok(())
+}
+
+/// Suspends the calling task for `millis` the way `Delay` does (see
+/// the module docs), for `Delay` and for `exec.library`'s synchronous
+/// `DoIO(TR_ADDREQUEST)`. Returns `true` when it blocked the task and
+/// switched to another one: `ctx.cpu` then holds that other task's
+/// registers, so the caller must return without touching them, and the
+/// call is re-trapped (and lands here again, reusing the deadline) once
+/// the task runs again. Returns `false` once the time is up.
+pub(crate) fn block_current_for<C: Cpu>(ctx: &mut HandlerContext<'_, C>, millis: u64) -> bool {
     let task = ctx.current_task;
 
     ctx.timers.fire_due(ctx.mem, ctx.tasks);
@@ -139,7 +151,7 @@ fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     loop {
         if std::time::Instant::now() >= deadline {
             ctx.timers.remove_delay(task);
-            return Ok(());
+            return false;
         }
 
         // Nothing here "remembers" to return once woken -- re-trapping
@@ -150,7 +162,7 @@ fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
             .block_current_on_delay(ctx.cpu, ctx.mem, ctx.trap_pc)
             .is_ok()
         {
-            return Ok(());
+            return true;
         }
 
         // No other task is runnable. Some other pending entry (another
@@ -171,7 +183,7 @@ fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
                 std::thread::sleep(deadline - now);
             }
             ctx.timers.remove_delay(task);
-            return Ok(());
+            return false;
         }
         // Something else fired -- possibly waking a task -- loop back
         // and recheck.

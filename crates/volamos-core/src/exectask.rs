@@ -2464,6 +2464,21 @@ fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
 /// assembler.
 fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
+    let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
+    if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
+        // Real DoIO waits for the request's reply, so the other tasks run
+        // in the meantime: suspend this one as Delay does, rather than
+        // sleeping the host thread with every task in it.
+        let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
+        let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
+        if crate::dosdate::block_current_for(ctx, millis) {
+            return Ok(());
+        }
+        ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
     let error = run_io_request(ctx.mem, ioreq);
     ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, error as u8);
     ctx.cpu
@@ -5552,6 +5567,96 @@ mod tests {
             rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET),
             IOERR_NOCMD as u8
         );
+    }
+
+    #[test]
+    fn do_io_timer_request_lets_another_ready_task_run() {
+        // DoIO(TR_ADDREQUEST) waits for its request the way Delay
+        // does (dosdate's delay_lets_another_ready_task_run): a
+        // CreateNewProc child spawned right before the parent's 100ms
+        // DoIO must get the CPU during it and write its marker. As a
+        // flat host sleep it starved every other task: libstdc++'s
+        // std::this_thread::sleep_for sleeps through DoIO, so a thread
+        // waiting that way for another one hung.
+        const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
+
+        fn patch(words: &mut [u16], idx: usize, value: u32) {
+            words[idx] = (value >> 16) as u16;
+            words[idx + 1] = value as u16;
+        }
+
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); DoIO(ioreq); return marker ---
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        words.push(0x223C); // move.l #imm32,D1 = tags (patched below)
+        let tags_idx = words.len();
+        words.extend_from_slice(&[0, 0]);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        let ioreq_idx = words.len();
+        words.extend_from_slice(&[0, 0]);
+        words.extend_from_slice(&jsr_disp16_a6(-456)); // DoIO
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        let marker_idx = words.len();
+        words.extend_from_slice(&[0, 0]);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: write the marker and exit ---
+        let child_entry = entry + (words.len() as u32) * 2;
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        let marker_idx_child = words.len();
+        words.extend_from_slice(&[0, 0]);
+        words.push(0x7000 | 0x2A); // moveq #0x2A,d0
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed by CreateNewProc
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let ioreq_addr = tags_addr + 32;
+        let load_end = ioreq_addr + 64;
+        patch(&mut words, tags_idx, tags_addr);
+        patch(&mut words, ioreq_idx, ioreq_addr);
+        patch(&mut words, marker_idx, marker_addr);
+        patch(&mut words, marker_idx_child, marker_addr);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+        for i in 0..40 {
+            mem.write_u8(ioreq_addr + i, 0);
+        }
+        mem.write_u32(ioreq_addr + IO_DEVICE_OFFSET, TIMER_DEVICE_BASE);
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 100_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A,
+            "the child must have run and written the marker during the parent's DoIO, not \
+             been starved of the CPU by a flat host sleep"
+        );
+        assert_eq!(rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET), 0);
     }
 
     #[test]
