@@ -2480,8 +2480,7 @@ fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
         let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
-        let duration = std::time::Duration::from_secs(u64::from(secs))
-            + std::time::Duration::from_micros(u64::from(micro));
+        let duration = timeval_duration(secs, micro);
         let retrap = ctx.timers.has_delay(ctx.current_task);
         if crate::dosdate::block_current_for(ctx, duration) {
             return Ok(());
@@ -2518,10 +2517,9 @@ fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
         let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
-        let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
         ctx.timers.push(
             ioreq,
-            std::time::Instant::now() + std::time::Duration::from_millis(millis),
+            std::time::Instant::now() + timeval_duration(secs, micro),
             ctx.current_task,
         );
         return Ok(());
@@ -2606,6 +2604,14 @@ pub(crate) fn host_time_secs_micro() -> (u32, u32) {
 /// `addr`.
 fn read_timeval(mem: &dyn AddressSpace, addr: u32) -> (u32, u32) {
     (mem.read_u32(addr), mem.read_u32(addr.wrapping_add(4)))
+}
+
+/// The time a `TR_ADDREQUEST` asks for, to the microsecond: rounding to
+/// whole milliseconds would make a 900us wait return at once and a
+/// 1900us one last 1ms.
+fn timeval_duration(secs: u32, micro: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(secs))
+        + std::time::Duration::from_micros(u64::from(micro))
 }
 
 /// Writes a `struct timeval` at `addr`.
@@ -5598,9 +5604,28 @@ mod tests {
 
     #[test]
     fn a_sub_millisecond_do_io_timer_request_lets_another_task_run() {
-        // sleep_for(100us): rounding to whole milliseconds made it a
-        // zero wait that never switched.
+        // sleep_for(100us): it used to round to a zero wait that never
+        // switched. Either the wait or the yield of a request due at
+        // once now gives the child its turn; timeval_duration's test
+        // pins the resolution.
         do_io_timer_request_runs_the_child(0, 100);
+    }
+
+    #[test]
+    fn timeval_duration_keeps_the_microseconds() {
+        use std::time::Duration;
+        for (secs, micro, expected) in [
+            (0, 0, Duration::ZERO),
+            (0, 100, Duration::from_micros(100)),
+            (0, 1_900, Duration::from_micros(1_900)),
+            (1, 500_000, Duration::from_millis(1_500)),
+        ] {
+            assert_eq!(
+                timeval_duration(secs, micro),
+                expected,
+                "{{{secs}, {micro}}}"
+            );
+        }
     }
 
     #[test]
