@@ -122,6 +122,17 @@ Changelog.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
   `SystemTagList`/`System`/`Execute` for tools that shell out to
   another guest program.
+- Hunk memory flags: `LoadSeg` and overlay programs place each hunk in
+  the kind of memory its size longword asks for. A `HUNKF_CHIP` hunk (data
+  for the custom chips) is in chip RAM, so `TypeOfMem` on it reports a
+  chip address as it would on hardware; a `HUNKF_FAST` hunk prefers fast
+  RAM and falls back to any memory when there is none; the extended form
+  names the `MEMF_*` attributes outright (and, like `AllocMem`, fails when
+  they cannot be met); an unflagged hunk takes any memory, preferring fast
+  RAM like `AllocMem(MEMF_ANY)`. A hunk that does not fit fails the
+  `LoadSeg` and frees what it had allocated. The program you start from
+  the command line is laid out in low memory, which is chip RAM, whatever
+  its flags say, so its `HUNKF_FAST` hunks load into chip RAM too.
 - `CheckSignal`.
 - `CreateNewProc` — a real second task, cooperatively scheduled
   alongside the main one (see `exec.library`'s "Tasks and signals"
