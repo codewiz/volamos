@@ -137,6 +137,7 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, u32::from(value), StoreSize::Byte) {
             return;
         }
+        self.check_guest_store(address, 1);
         AddressSpace::write_u8(self, address, value);
     }
 
@@ -145,6 +146,7 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, u32::from(value), StoreSize::Word) {
             return;
         }
+        self.check_guest_store(address, 2);
         AddressSpace::write_u16(self, address, value);
     }
 
@@ -153,7 +155,17 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, value, StoreSize::Long) {
             return;
         }
+        self.check_guest_store(address, 4);
         AddressSpace::write_u32(self, address, value);
+    }
+
+    /// The `m68k` crate calls this once per exception dispatch, in
+    /// `jump_vector`, immediately before it reads the vector -- and
+    /// nowhere else (m68k 0.17.0). `--sanitize`'s low-memory check uses
+    /// it to tell that read from a guest data access; see
+    /// [`crate::sanitize::ShadowMap::note_vector_fetch`].
+    fn ipl_release_sample(&mut self) {
+        self.note_vector_fetch();
     }
 
     /// Instruction-stream word read -- distinct from [`Self::
@@ -1097,6 +1109,7 @@ impl Cpu for M68kCpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sanitize::AccessSite;
 
     /// Loads `words` (big-endian opcode/operand words) into `mem` starting
     /// at `addr`.
@@ -1142,6 +1155,139 @@ mod tests {
         mem.enable_sanitizer();
 
         assert!(AddressBus::fast_mem(&mut mem).is_none());
+    }
+
+    /// A sanitized memory with both guest-access detectors on, for the
+    /// bus-path tests below (issues #71/#72).
+    fn access_checked_memory() -> FlatMemory {
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        mem.enable_sanitizer();
+        let shadow = mem.shadow_mut().unwrap();
+        shadow.report_low_memory = true;
+        shadow.report_wild = true;
+        mem
+    }
+
+    #[test]
+    fn only_the_guest_cpus_bus_accesses_are_checked_for_low_memory_and_wild_pointers() {
+        // The distinction the whole feature rests on: the CPU reaches
+        // memory through the AddressBus impl, a native library handler
+        // through AddressSpace. Handlers write ExecBase, library bases and
+        // the vector slots constantly and must never be reported.
+        let mut mem = access_checked_memory();
+        let wild = (TEST_MEM_SIZE as u32) + 0x1000;
+
+        // The handler path: silent, and still total.
+        AddressSpace::write_u32(&mut mem, 0x2C, 0xDEAD_BEEF);
+        assert_eq!(AddressSpace::read_u32(&mem, 0x2C), 0xDEAD_BEEF);
+        AddressSpace::write_u32(&mut mem, 0, 1);
+        assert_eq!(AddressSpace::read_u32(&mem, wild), 0);
+        AddressSpace::write_u32(&mut mem, wild, 7);
+        assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+
+        // The CPU's own data accesses: reported.
+        AddressBus::write_long(&mut mem, 0, 2);
+        AddressBus::read_long(&mut mem, 0x10);
+        AddressBus::read_byte(&mut mem, wild);
+        AddressBus::write_word(&mut mem, wild, 1);
+        assert_eq!(mem.shadow().unwrap().violation_count(), 4);
+    }
+
+    #[test]
+    fn instruction_fetches_and_peeks_are_never_guest_data_accesses() {
+        let mut mem = access_checked_memory();
+        let wild = (TEST_MEM_SIZE as u32) + 0x1000;
+        // Opcode and extension-word fetches (a JSR into a jump table, an
+        // A-line stub in low memory) go through read_immediate_*.
+        AddressBus::read_immediate_word(&mut mem, 0xC4);
+        AddressBus::read_immediate_long(&mut mem, 0x2CC);
+        AddressBus::read_immediate_word(&mut mem, wild);
+        // The sanitizer's own look at memory.
+        mem.peek_u16(0x10);
+        mem.peek_u32(0x20);
+        assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+    }
+
+    #[test]
+    fn a_store_a_port_claims_is_not_a_wild_write() {
+        // --uae-debug / --emu68-debug put their hooks at addresses no RAM
+        // backs; a deliberate store to one is not a wild pointer.
+        struct DebugPort;
+        impl crate::memory::StorePort for DebugPort {
+            fn claims(&self, addr: u32) -> bool {
+                addr == 0xBF_FF00
+            }
+            fn store(&mut self, _: &dyn AddressSpace, _: u32, _: u32, _: crate::memory::StoreSize) {
+            }
+        }
+        let mut mem = access_checked_memory();
+        mem.add_store_port(Box::new(DebugPort));
+        AddressBus::write_byte(&mut mem, 0xBF_FF00, b'x');
+        assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+        // The same store one byte over is nobody's, so it is reported.
+        AddressBus::write_byte(&mut mem, 0xBF_FF01, b'x');
+        assert_eq!(mem.shadow().unwrap().violation_count(), 1);
+    }
+
+    #[test]
+    fn a_movem_dummy_read_past_the_end_of_ram_is_not_a_wild_read() {
+        // A 68000 MOVEM <ea>,<list> reads one word past its last
+        // register and discards it; at the top of a RAM region that is
+        // past the end. 4 registers from (end - 16) end exactly there.
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
+        mem.enable_sanitizer();
+        mem.shadow_mut().unwrap().report_wild = true;
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[0x4CD8, 0x000F]); // movem.l (a0)+,d0-d3
+        cpu.set_address_register(AddressRegister(0), (TEST_MEM_SIZE - 16) as u32);
+        cpu.step(&mut mem);
+        assert_eq!(
+            mem.shadow().unwrap().violation_count(),
+            0,
+            "{:?}",
+            mem.shadow().unwrap().violations()
+        );
+    }
+
+    #[test]
+    fn a_hardware_exception_vector_fetch_is_not_reported() {
+        // The crate reads a vector with an ordinary read_long, right
+        // after calling ipl_release_sample; the bus impl turns that into
+        // "the next read is the CPU's".
+        let mut mem = access_checked_memory();
+        AddressBus::ipl_release_sample(&mut mem);
+        AddressBus::read_long(&mut mem, 0x2C);
+        assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+        AddressBus::read_long(&mut mem, 0x2C);
+        assert_eq!(mem.shadow().unwrap().violation_count(), 1);
+    }
+
+    #[test]
+    fn an_executed_null_store_and_wild_load_are_reported_with_the_guests_pc() {
+        // End to end through the CPU: move.w d0,($0).w ; move.l (a0),d1
+        // with a0 pointing nowhere.
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
+        let shadow = {
+            mem.enable_sanitizer();
+            mem.shadow_mut().unwrap()
+        };
+        shadow.report_low_memory = true;
+        shadow.report_wild = true;
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[0x31C0, 0x0000, 0x2210]);
+        cpu.set_address_register(AddressRegister(0), 0xAAAA_4444);
+
+        cpu.step(&mut mem);
+        cpu.step(&mut mem);
+
+        let v = mem.shadow().unwrap().violations();
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert_eq!((v[0].addr, v[0].pc), (0, start));
+        assert_eq!(v[0].site, Some(AccessSite::NullPointer));
+        assert_eq!(
+            (v[1].pc, v[1].site),
+            (start + 4, Some(AccessSite::Unmapped))
+        );
     }
 
     #[test]
