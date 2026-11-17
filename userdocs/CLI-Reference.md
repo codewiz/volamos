@@ -371,12 +371,12 @@ for `-m68020-60 -m68881`-compiled code, which assumes the FPU just
 exists), it used to land on whatever garbage happened to be at the
 real vector-11 slot, surfacing as a baffling "continuation stub
 trapped ... with no pending continuation." That slot is now pre-seeded
-with a dedicated stub, so this reports a clean, attributable stop
-instead:
+with a dedicated stub, so this reports a clean stop that names the
+instruction:
 
 ```console
 $ volamos --cpu 68060 --no-fpu a-68060-fpu-binary
-volamos: a-68060-fpu-binary: unexpected CPU stop at 0x00002c02: Illegal { opcode: ... }
+volamos: a-68060-fpu-binary: unexpected CPU stop at 0x00002c02: f200 0000: FPU instruction on 68060 with no FPU (exception vector 11)
 ```
 
 A guest that installs its own real FPU-probe handler before executing
@@ -422,19 +422,18 @@ Only meaningful with `--cpu 68040`/`68060`; a no-op for every other
 `--cpu` model. Default: off — real hardware fidelity, matching every
 other `--cpu` model's default behavior, so a 68040-FP-targeted binary
 traps under either `--cpu 68040` or `--cpu 68060` unless this is given.
+The trap stops the run and names the instruction, which is how a
+compiler's test suite notices code that a real 68040/68060 can't run:
+
+```console
+$ volamos --cpu 68040 a-68881-binary
+volamos: a-68881-binary: unexpected CPU stop at 0x000032ec: f200 0003: unimplemented FPU instruction on 68040 (exception vector 11)
+hint: --fpsp-emulate adds trap handlers equivalent to 680x0.library
+```
 
 ```sh
 volamos --cpu 68060 --fpu --fpsp-emulate a-68040-fp-binary
 volamos --cpu 68040 --fpsp-emulate a-68040-fp-binary
-```
-
-Without the flag, a guest that executes one of these instructions and
-hasn't installed its own Line-F handler stops with a message that names
-the instruction and what to do about it, instead of crashing somewhere
-unrelated:
-
-```text
-volamos: t: unexpected CPU stop at 0x00003304: unimplemented FPU instruction FSIN: the 68040/68060 leave it to their FPSP software package, which volamos only runs with --fpsp-emulate (...) -- re-run with --fpsp-emulate
 ```
 
 A guest that installs its own handler at the Line-F vector (as
