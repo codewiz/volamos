@@ -153,6 +153,17 @@ pub trait Cpu {
     /// Writes an address register (A0-A7).
     fn set_address_register(&mut self, reg: AddressRegister, value: u32);
 
+    /// The CPU model being emulated.
+    fn cpu_type(&self) -> crate::backend::CpuType;
+
+    /// Whether the CPU has an FPU: configured with one, and not a model
+    /// that lacks it (68EC040, 68LC040).
+    fn has_fpu(&self) -> bool;
+
+    /// Whether the CPU executes what a 68040/68060 dropped from silicon
+    /// (`--fpsp-emulate`) instead of trapping.
+    fn fpsp_emulate(&self) -> bool;
+
     /// Reads the program counter.
     fn pc(&self) -> u32;
 

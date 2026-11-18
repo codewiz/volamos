@@ -2480,7 +2480,7 @@ fn build_nested_runtime(
     // install_line_f_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_line_f_decline_stub(&mut runtime, cpu_type, fpu, fpsp_emulate);
+    install_line_f_decline_stub(&mut runtime, cpu_type);
     // A nested System()/Execute() run is still the real CLI process --
     // see Runtime::enable_host_break_folding's doc (issue #210).
     runtime.enable_host_break_folding();
@@ -2589,7 +2589,7 @@ fn build_runtime_with_vfs(
     // install_line_f_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_line_f_decline_stub(&mut runtime, opts.cpu_type, opts.fpu, opts.fpsp_emulate);
+    install_line_f_decline_stub(&mut runtime, opts.cpu_type);
     // Only the real CLI opts into folding a host SIGINT/SIGTERM into the
     // guest's SIGBREAKF_CTRL_C (issue #210) -- see
     // Runtime::enable_host_break_folding's doc for why this is opt-in
@@ -5065,16 +5065,14 @@ mod tests {
 
         match result {
             Err(volamos_core::dispatch::RuntimeError::UnexpectedStop { reason, pc }) => {
-                assert_eq!(pc, volamos_core::dispatch::LINE_F_DECLINE_STUB_ADDR);
-                assert!(
-                    reason.contains("Illegal"),
-                    "expected an Illegal-instruction trap, got {reason:?}"
+                // the opcode words in the reason are read at pc
+                assert_ne!(pc, volamos_core::dispatch::LINE_F_DECLINE_STUB_ADDR);
+                assert_eq!(
+                    reason,
+                    "f200 0000: FPU instruction on 68060 with no FPU (exception vector 11)"
                 );
             }
-            other => panic!(
-                "expected a clean UnexpectedStop (Illegal) trap at \
-                 LINE_F_DECLINE_STUB_ADDR, got {other:?}"
-            ),
+            other => panic!("expected a clean UnexpectedStop, got {other:?}"),
         }
     }
 }

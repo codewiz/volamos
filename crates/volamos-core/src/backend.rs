@@ -91,9 +91,8 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// which the heap-start rounding in `crate::dispatch::Runtime::new`'s
 /// own doc relies on -- no library involved at all) from `0x2C00` for
 /// [`crate::dispatch::LINE_F_DECLINE_STUB_ADDR`] (issue #167's
-/// second half): the fixed-address stub pre-seeded into vector 11's slot
-/// for `--cpu 68060 --no-fpu` and (#217) for a 68040/68060 with an FPU
-/// and no `--fpsp-emulate`, so the `m68k` crate's internal 68060
+/// second half): the fixed-address stub pre-seeded into the slots of
+/// vectors 11, 55, 60 and 61 on a 68040/68060, so the `m68k` crate's internal 68060
 /// FPU-disabled and unimplemented-FPU-instruction exception delivery (which bypasses
 /// [`Cpu::take_hardware_exception`] entirely -- see that constant's doc
 /// for the full mechanism) lands on a clean trap instead of falling
@@ -1014,6 +1013,23 @@ impl Cpu for M68kCpu {
 
     fn address_register(&self, reg: AddressRegister) -> u32 {
         self.core.a(reg.0 as usize)
+    }
+
+    fn cpu_type(&self) -> CpuType {
+        self.core.cpu_type
+    }
+
+    fn has_fpu(&self) -> bool {
+        self.core.fpu_present
+            && !matches!(self.core.cpu_type, CpuType::M68EC040 | CpuType::M68LC040)
+    }
+
+    fn fpsp_emulate(&self) -> bool {
+        if self.core.cpu_type == CpuType::M68060 {
+            self.core.emulate_unimplemented_060
+        } else {
+            self.core.emulate_unimplemented_040
+        }
     }
 
     fn set_address_register(&mut self, reg: AddressRegister, value: u32) {
