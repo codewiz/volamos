@@ -84,6 +84,11 @@ pub const ERROR_NO_FREE_STORE: i32 = 103;
 /// `ERROR_BAD_NUMBER`: a numeric argument is out of range -- here, a
 /// buffer length that doesn't fit in guest memory.
 pub const ERROR_BAD_NUMBER: i32 = 115;
+/// `ERROR_COMMENT_TOO_BIG`: a file comment longer than `fib_Comment`'s 79
+/// characters (`<dos/dos.h>`: `TEXT fib_Comment[80]`).
+pub const ERROR_COMMENT_TOO_BIG: i32 = 220;
+/// Longest comment `fib_Comment[80]` can hold, excluding its NUL.
+pub const MAX_COMMENT_LEN: usize = 79;
 /// An object with that name is already in use (e.g. a lock preventing
 /// deletion). Not currently produced by any T10 handler, but part of the
 /// documented mapping surface.
@@ -280,6 +285,16 @@ fn open_host_file_for_mode(host_path: &std::path::Path, access_mode: i32) -> Res
         // case, which calls this with MODE_OLDFILE regardless of the
         // lock's access mode -- see that method's doc): read+write,
         // falling back to read-only.
+        //
+        // A directory is not a file: `Open(dir, MODE_OLDFILE)` fails with
+        // `ERROR_OBJECT_WRONG_TYPE`, which is how programs tell the two
+        // apart. The read-only fallback used to *succeed* on a Unix
+        // directory, handing back a handle whose every `Read` then failed
+        // (issue #362). The other modes already failed on the host
+        // (EISDIR) and are left as they were.
+        if host_path.is_dir() {
+            return Err(ERROR_OBJECT_WRONG_TYPE);
+        }
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -4449,6 +4464,21 @@ mod tests {
         assert_eq!(
             code, DOSTRUE as i32,
             "LockRecords and UnLockRecords should both always succeed"
+        );
+    }
+
+    #[test]
+    fn open_on_a_directory_fails_with_object_wrong_type_362() {
+        // The read-only fallback used to succeed on a Unix directory; real
+        // Open fails 212, which is how programs tell files from dirs.
+        let tmp = TempDir::new("open-dir");
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        assert_eq!(
+            dos.open(&mut heap, &mut mem, "SYS:d", MODE_OLDFILE),
+            Err(ERROR_OBJECT_WRONG_TYPE)
         );
     }
 }
