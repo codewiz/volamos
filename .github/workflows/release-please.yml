@@ -28,14 +28,21 @@ on:
   push:
     branches: [main]
 
+# Read-only by default: only the release-please job below (which opens the
+# release PR and creates the tag/release) needs to write. The test and
+# build jobs run `cargo` -- and so every dependency's build script -- and
+# used to inherit a write-capable token from here (issue #364). Jobs that
+# publish (docker, release-publish, docs) declare their own grants.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -53,6 +60,8 @@ jobs:
     name: Test (${{ matrix.os }})
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,6 +71,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - uses: ./.github/actions/rust-setup
         with:
@@ -115,6 +125,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
@@ -152,6 +163,8 @@ jobs:
     name: Standalone binary (${{ matrix.target }})
     needs: [release-please, test, docker]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -165,6 +178,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
@@ -205,11 +219,14 @@ jobs:
     name: Standalone binary (aarch64-apple-darwin)
     needs: [release-please, test]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - uses: ./.github/actions/rust-setup
         with:
@@ -241,11 +258,14 @@ jobs:
     name: Standalone binary (x86_64-pc-windows-gnu)
     needs: [release-please, test]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - uses: ./.github/actions/rust-setup
         with:
