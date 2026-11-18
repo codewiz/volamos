@@ -599,11 +599,74 @@ fn class_matches(c: u8, negate: bool, ranges: &[(u8, u8)], fold: bool) -> bool {
     hit != negate
 }
 
+/// Work and nesting limits for one [`full_match`]. The matcher backtracks
+/// in continuation-passing style, so its recursion depth grows with the
+/// input and its running time can be exponential in the pattern (issue
+/// #361: `#?` against a 60 KB line overflowed the host stack and aborted
+/// the process, and ten `#?` then `b` against 30 `a`s took 18 s). Past
+/// either limit the match simply fails: the host stays up and answers in
+/// bounded time, at the price of a possible false "no match" for a
+/// pathological pattern or an enormous input with a nested repeat. A `~`
+/// never turns a spent budget into a match ([`EXHAUSTED`]).
+const MATCH_FUEL: u64 = 4_000_000;
+const MATCH_MAX_DEPTH: u32 = 1000;
+
+thread_local! {
+    static FUEL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Set once either limit was hit during the current match. `~` must
+    /// not read the resulting `false` as "the inner pattern didn't
+    /// match" -- that would turn a spent budget into a positive match.
+    static EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Decrements the nesting depth on drop, so every exit from
+/// [`match_node`] restores it.
+struct DepthGuard;
+
+impl DepthGuard {
+    /// `None` when the work or depth limit is spent.
+    fn enter() -> Option<Self> {
+        if FUEL.get() == 0 {
+            EXHAUSTED.set(true);
+            return None;
+        }
+        FUEL.set(FUEL.get() - 1);
+        let depth = DEPTH.get();
+        if depth >= MATCH_MAX_DEPTH {
+            EXHAUSTED.set(true);
+            return None;
+        }
+        DEPTH.set(depth + 1);
+        Some(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.set(DEPTH.get() - 1);
+    }
+}
+
+/// Whether `node` is a single-byte matcher (`#` of one is then a plain
+/// loop, not a recursion per consumed byte).
+fn single_byte_matches(node: &Node, c: u8, fold: bool) -> Option<bool> {
+    match node {
+        Node::Literal(l) => Some(byte_eq(c, *l, fold)),
+        Node::Any => Some(true),
+        Node::Class { negate, ranges } => Some(class_matches(c, *negate, ranges, fold)),
+        _ => None,
+    }
+}
+
 /// Tries every way `node` can consume input starting at `input[ii..]`,
 /// calling `k(j)` for each resulting end position `j`; succeeds if any
 /// call to `k` succeeds. Continuation-passing style so `Seq`/`Alt`/
 /// `Repeat` compose correctly regardless of nesting.
 fn match_node(node: &Node, input: &[u8], ii: usize, fold: bool, k: &dyn Fn(usize) -> bool) -> bool {
+    let Some(_guard) = DepthGuard::enter() else {
+        return false;
+    };
     match node {
         Node::Literal(c) => ii < input.len() && byte_eq(input[ii], *c, fold) && k(ii + 1),
         Node::Any => ii < input.len() && k(ii + 1),
@@ -617,10 +680,25 @@ fn match_node(node: &Node, input: &[u8], ii: usize, fold: bool, k: &dyn Fn(usize
             // Simplified whole-remainder scope -- see the module docs'
             // "~ scope" note.
             let inner_matches_rest = match_node(inner, input, ii, fold, &|j| j == input.len());
-            if inner_matches_rest {
+            if inner_matches_rest || EXHAUSTED.get() {
                 false
             } else {
                 k(input.len())
+            }
+        }
+        Node::Repeat(inner) if single_byte_matches(inner, 0, fold).is_some() => {
+            // `#?`, `#a`, `#[a-z]`: zero or more of one byte. A loop over
+            // the end positions, not a recursion per byte.
+            let mut j = ii;
+            loop {
+                if k(j) {
+                    return true;
+                }
+                if j < input.len() && single_byte_matches(inner, input[j], fold) == Some(true) {
+                    j += 1;
+                } else {
+                    return false;
+                }
             }
         }
         Node::Repeat(inner) => {
@@ -670,6 +748,9 @@ fn match_seq(
 }
 
 pub(crate) fn full_match(node: &Node, input: &[u8], fold: bool) -> bool {
+    FUEL.set(MATCH_FUEL);
+    DEPTH.set(0);
+    EXHAUSTED.set(false);
     match_node(node, input, 0, fold, &|j| j == input.len())
 }
 
@@ -1009,5 +1090,37 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 1, "icon.info should match #?.info");
+    }
+
+    #[test]
+    fn star_against_a_huge_line_does_not_overflow_the_host_stack_361() {
+        // `#?` recursed once per matched byte: a 60 KB line aborted the
+        // whole process ("stack overflow, aborting").
+        let line = "a".repeat(300_000);
+        assert!(m("#?", &line, false));
+        assert!(m("#?a", &line, false));
+        assert!(!m("#?b", &line, false));
+        assert!(m("#[a-z]", &line, false));
+    }
+
+    #[test]
+    fn many_stars_then_a_mismatch_finish_in_bounded_time_361() {
+        // Ten `#?` then `b` against 30 `a`s: exponential backtracking
+        // (18 s before). The work limit makes it answer, and the right
+        // answer here is "no match".
+        let started = std::time::Instant::now();
+        assert!(!m("#?#?#?#?#?#?#?#?#?#?b", &"a".repeat(30), false));
+        assert!(started.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn a_spent_match_budget_does_not_turn_a_negation_into_a_match_361() {
+        // The inner pattern does match the whole name, but the exponential
+        // search for it can exhaust the work limit first. `~` must then
+        // answer "no match", not read the failed search as "inner didn't
+        // match" and accept the name the pattern was meant to exclude.
+        // `#(ab)` recurses once per repetition, so 1200 bytes blow past the
+        // depth limit while the pattern does match.
+        assert!(!m("~(#(ab))", &"ab".repeat(600), false));
     }
 }
