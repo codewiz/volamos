@@ -97,11 +97,12 @@
 //! # `AllocVec`/`FreeVec`: the classic "+4 header" scheme
 //!
 //! Real `AllocVec` allocates `byteSize + sizeof(ULONG)` bytes, stores the
-//! *total* allocated size in the leading `ULONG`, and returns a pointer
-//! just past it -- so `FreeVec` (which takes no size argument at all) can
-//! recover how much to free from `returned_ptr[-1]`. This module follows
+//! requested size plus 4 (`byteSize + 4`, *not* rounded up -- measured on
+//! real Kickstart 3.1) in the leading `ULONG`, and returns a pointer
+//! just past it -- so a guest can read the size back from
+//! `returned_ptr[-1]` (the block itself is that, rounded up to 8). This module follows
 //! that scheme exactly: the block is `AllocMem`-aligned (8 bytes, above),
-//! the header is the 4-byte total at `block[0..4]`, and `AllocVec` returns
+//! the header is the 4-byte `byteSize + 4` at `block[0..4]`, and `AllocVec` returns
 //! `block + 4`, so the result is always 4 mod 8 as on exec. (An earlier
 //! version used an 8-byte header to keep the result 8-aligned on a heap that
 //! was itself only 4-aligned; that gave neither exec's addresses nor stable
@@ -473,7 +474,7 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         return Ok(());
     }
 
-    // Real AllocVec is AllocMem(byteSize + 4) with the total stored in
+    // Real AllocVec is AllocMem(byteSize + 4) with `byteSize + 4` stored in
     // the leading ULONG; the 8-aligned block's rounding gives the guest
     // up to 4 spare bytes past `byteSize`, which are its to use.
     let total = round_up_8(byte_size.saturating_add(ALLOCVEC_HEADER_SIZE));
@@ -486,9 +487,13 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         MEMBLOCKSIZE,
     ) {
         Ok(block) => {
-            // Header: the total block size (u32), as the module docs
-            // describe.
-            ctx.mem.write_u32(block, total);
+            // Header: `byteSize + 4`, *not* the rounded block size.
+            // Measured on real Kickstart 3.1 (r40.68, via Copperline):
+            // AllocVec(1, 5, 10, 13, 40) leaves 5, 9, 14, 17, 44 at
+            // `ptr[-1]` (issue #360). A guest that reads it back to learn
+            // the size (as `FreeVec` itself does) sees exactly that.
+            ctx.mem
+                .write_u32(block, byte_size.saturating_add(ALLOCVEC_HEADER_SIZE));
 
             let user_ptr = block.wrapping_add(ALLOCVEC_HEADER_SIZE);
             let cleared = requirements & MEMF_CLEAR != 0;
@@ -1748,11 +1753,12 @@ mod tests {
         for i in 0..32u32 {
             assert_eq!(rt.memory().read_u8(addr + i), 0);
         }
-        // The header (the ULONG just before the returned pointer) should
-        // hold the total block size, exactly as the module docs promise:
-        // 32 + 4 rounded up to the 8-byte block size.
+        // The header (the ULONG just before the returned pointer) holds
+        // `byteSize + 4` *unrounded*, as measured on real Kickstart 3.1
+        // (Copperline, issue #360): 32 + 4 = 36, even though the block
+        // itself is rounded up to 40.
         let total = rt.memory().read_u32(addr - 4);
-        assert_eq!(total, 40);
+        assert_eq!(total, 36);
     }
 
     /// Runs `AllocMem(100)` (`vec == false`) or `AllocVec(100)` and returns
@@ -2844,5 +2850,32 @@ mod tests {
         let mut out = Vec::new();
         let err = rt.run(&mut out, None).unwrap_err().to_string();
         assert!(err.contains("outside guest memory"), "{err}");
+    }
+
+    /// Runs `AllocVec(size)` and returns the `ptr[-1]` header it left.
+    fn alloc_vec_header(size: u32) -> (u32, u32) {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push((size >> 16) as u16);
+        words.push(size as u16);
+        words.push(move_imm_to_d(1)); // D1 = 0: no flags
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-684)); // AllocVec
+        words.push(RTS);
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed") as u32;
+        (code, rt.memory().read_u32(code - 4))
+    }
+
+    #[test]
+    fn alloc_vec_header_is_the_unrounded_size_plus_four_360() {
+        // Measured on real Kickstart 3.1 (r40.68) via Copperline.
+        for (size, header) in [(1, 5), (4, 8), (5, 9), (10, 14), (13, 17), (40, 44)] {
+            let (ptr, got) = alloc_vec_header(size);
+            assert_eq!(got, header, "AllocVec({size}) header");
+            assert_eq!(ptr % 8, 4, "AllocVec({size}) is 4 mod 8");
+        }
     }
 }
