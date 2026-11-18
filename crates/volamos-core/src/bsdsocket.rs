@@ -50,6 +50,7 @@ use crate::memory::AddressSpace;
 
 // --- Fixed BSD errno numbering (bsdsocket.library's own, not the host's) ---
 
+pub const EINTR: i32 = 4;
 pub const EBADF: i32 = 9;
 pub const EACCES: i32 = 13;
 pub const EFAULT: i32 = 14;
@@ -175,6 +176,7 @@ fn translate_errno(e: &std::io::Error) -> i32 {
     // need this function to also know about it.
     match e.kind() {
         WouldBlock => EAGAIN,
+        Interrupted => EINTR,
         ConnectionRefused => ECONNREFUSED,
         ConnectionReset | ConnectionAborted => ECONNRESET,
         NotConnected => ENOTCONN,
@@ -265,7 +267,6 @@ impl SocketEntry {
 /// natural coupling to `dos.library`'s own state.
 pub struct BsdSocketState {
     sockets: HashMap<i32, SocketEntry>,
-    next_id: i32,
     /// The last error code any handler here set -- what `Errno()`
     /// returns.
     last_errno: i32,
@@ -378,10 +379,26 @@ pub struct BsdSocketState {
 const SIGBREAKF_CTRL_C: u32 = 1 << 12;
 
 impl BsdSocketState {
+    /// The lowest unused descriptor number (from 1), like BSD's lowest
+    /// free fd. Numbers are reused after `CloseSocket`, so they stay
+    /// small instead of counting up for the life of the process.
+    ///
+    /// `None` when every number below [`Self::fd_limit`] is taken.
+    fn lowest_free_fd(&self) -> Option<i32> {
+        (1..self.fd_limit() as i32).find(|fd| !self.sockets.contains_key(fd))
+    }
+
+    /// One past the highest descriptor number this runtime hands out:
+    /// the descriptor table size, but never beyond what a guest
+    /// `fd_set` (256 bits) can name -- a higher fd could never be
+    /// reported by `WaitSelect`.
+    fn fd_limit(&self) -> u32 {
+        self.dtablesize.min(FD_SET_BYTES * 8)
+    }
+
     pub fn new() -> Self {
         Self {
             sockets: HashMap::new(),
-            next_id: 1,
             last_errno: 0,
             errno_ptr: None,
             errno_ptr_size: 4,
@@ -503,7 +520,7 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
     };
 
-    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
+    if ctx.bsdsocket.lowest_free_fd().is_none() {
         fail(ctx, EMFILE);
         return Ok(());
     }
@@ -531,8 +548,10 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     // module docs' "Blocking by default" section). Non-blocking mode is
     // only entered via an explicit IoctlSocket(fd, FIONBIO, ...) call.
 
-    let id = ctx.bsdsocket.next_id;
-    ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
+    let id = ctx
+        .bsdsocket
+        .lowest_free_fd()
+        .expect("checked for a free descriptor above");
     ctx.bsdsocket.sockets.insert(id, SocketEntry::new(socket));
     ctx.bsdsocket.set_errno(ctx.mem, 0);
     ctx.cpu.set_data_register(DataRegister(0), id as u32);
@@ -627,7 +646,7 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
     let addr_ptr = ctx.cpu.address_register(AddressRegister(0));
 
-    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
+    if ctx.bsdsocket.lowest_free_fd().is_none() {
         ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
@@ -643,8 +662,10 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
             {
                 write_sockaddr_in(ctx.mem, addr_ptr, peer);
             }
-            let id = ctx.bsdsocket.next_id;
-            ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
+            let id = ctx
+                .bsdsocket
+                .lowest_free_fd()
+                .expect("checked for a free descriptor above");
             let mut entry = SocketEntry::new(accepted);
             entry.connected = true;
             ctx.bsdsocket.sockets.insert(id, entry);
@@ -1541,6 +1562,11 @@ fn wait_select_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     )
 }
 
+/// How long one `poll(2)` in [`wait_select_poll`] may block before the
+/// host checks for a Ctrl-C, a due timer and a wanted signal.
+#[cfg(unix)]
+const WAIT_SELECT_SLICE_MS: i32 = 50;
+
 #[cfg(unix)]
 fn wait_select_poll<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
@@ -1641,19 +1667,90 @@ fn wait_select_poll<C: Cpu>(
         .collect();
     pollfds.extend(event_pollfds);
 
-    let timeout_ms: i32 = if timeout_ptr == 0 {
-        -1
+    let deadline =
+        (timeout_ptr != 0).then(|| std::time::Instant::now() + read_timeval(ctx.mem, timeout_ptr));
+    let signals_requested = if signals_ptr != 0 {
+        ctx.mem.read_u32(signals_ptr)
     } else {
-        let d = read_timeval(ctx.mem, timeout_ptr);
-        d.as_millis().min(i32::MAX as u128) as i32
+        0
     };
+    // With no fds to watch, no timeout and no signal to wake on, nothing
+    // could ever end this call: fail loudly instead of hanging the host.
+    if pollfds.is_empty() && deadline.is_none() && signals_requested == 0 {
+        return Err(DispatchError::HandlerFailed {
+            library: "bsdsocket.library".to_string(),
+            lvo: -126,
+            handler_name: "WaitSelect".to_string(),
+            message: "WaitSelect would block forever: no socket of interest, no timeout and \
+                      no signal mask to wake on"
+                .to_string(),
+        });
+    }
 
-    let ready = unsafe {
-        libc::poll(
-            pollfds.as_mut_ptr(),
-            pollfds.len() as libc::nfds_t,
-            timeout_ms,
-        )
+    // Poll in short slices rather than one unbounded `poll(2)`: this
+    // runtime is single-threaded and cooperative, so between slices the
+    // host can deliver a Ctrl-C, fire a due `timer.device` request and
+    // notice a signal the caller asked to be woken by (`WaitSelect(0,
+    // NULL, NULL, NULL, NULL, &sigs)` is the usual `Wait()` replacement).
+    // A NULL timeout used to be `poll(.., -1)`, which nothing could end
+    // (issue #363); EINTR (a host signal) used to surface as errno EIO.
+    let ready = loop {
+        let slice_ms = match deadline {
+            // Rounded *up*: a sub-millisecond remainder truncated to a
+            // 0 ms slice and spun on poll(0) until the deadline passed.
+            Some(d) => d
+                .saturating_duration_since(std::time::Instant::now())
+                .as_micros()
+                .div_ceil(1000)
+                .min(WAIT_SELECT_SLICE_MS as u128) as i32,
+            None => WAIT_SELECT_SLICE_MS,
+        };
+        let polled = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                slice_ms,
+            )
+        };
+        if polled > 0 {
+            break polled;
+        }
+        if polled < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                let code = translate_errno(&err);
+                if signals_ptr != 0 {
+                    ctx.mem.write_u32(signals_ptr, 0);
+                }
+                ctx.bsdsocket.set_errno(ctx.mem, code);
+                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+                return Ok(());
+            }
+        }
+        // Nothing ready yet (or interrupted): let the host world in.
+        exectask::fold_pending_host_break(ctx.mem, ctx.tasks);
+        ctx.timers.fire_due(ctx.mem, ctx.tasks);
+        if signals_requested != 0 {
+            let task = ctx.current_task;
+            let recvd = ctx.mem.read_u32(task + exectask::TC_SIGRECVD);
+            let matched = recvd & signals_requested;
+            if matched != 0 {
+                ctx.mem
+                    .write_u32(task + exectask::TC_SIGRECVD, recvd & !matched);
+                ctx.mem.write_u32(signals_ptr, matched);
+                for ptr in [readfds_ptr, writefds_ptr, exceptfds_ptr] {
+                    if ptr != 0 {
+                        fd_set_zero(ctx.mem, ptr);
+                    }
+                }
+                ctx.bsdsocket.set_errno(ctx.mem, 0);
+                ctx.cpu.set_data_register(DataRegister(0), 0);
+                return Ok(());
+            }
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break 0;
+        }
     };
 
     if signals_ptr != 0 {
@@ -2747,8 +2844,25 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let src_listener = entry.is_listener;
     let src_connected = entry.connected;
 
+    // A real dup2() to a descriptor at or past the table size is EBADF;
+    // and numbers are reused like BSD's lowest-free-fd, never counted up
+    // forever (a long-running server's later sockets used to land beyond
+    // the 256-bit fd_sets WaitSelect can report, and a huge target wrapped
+    // the counter onto a live fd -- issue #363).
+    if new_fd >= 0 && new_fd as u32 >= ctx.bsdsocket.fd_limit() {
+        ctx.bsdsocket.set_errno(ctx.mem, EBADF);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
     let id = if new_fd < 0 {
-        ctx.bsdsocket.next_id
+        match ctx.bsdsocket.lowest_free_fd() {
+            Some(id) => id,
+            None => {
+                ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
+                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+                return Ok(());
+            }
+        }
     } else {
         new_fd
     };
@@ -2759,14 +2873,6 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // enforce this same cap on every path that does grow it; this one
     // didn't, letting a guest looping on Dup2Socket(old, -1) grow the
     // real, open-host-fd table without bound.
-    if !ctx.bsdsocket.sockets.contains_key(&id)
-        && ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize
-    {
-        ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
-        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
-        return Ok(());
-    }
-
     let dup = match entry.socket.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -2777,11 +2883,6 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         }
     };
 
-    if new_fd < 0 {
-        ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
-    } else if new_fd >= ctx.bsdsocket.next_id {
-        ctx.bsdsocket.next_id = new_fd.wrapping_add(1).max(1);
-    }
     // A dup shares the underlying connection's state -- carry the
     // lifecycle flags over so event classification treats it like the
     // original (see SocketEntry::connected's doc).
@@ -5344,5 +5445,93 @@ mod tests {
             code, 0,
             "getnetbyaddr should honestly report NULL rather than crashing"
         );
+    }
+
+    #[test]
+    fn lowest_free_fd_reuses_closed_descriptor_numbers_363() {
+        let mut state = BsdSocketState::new();
+        let sock = || Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        for fd in 1..=3 {
+            state.sockets.insert(fd, SocketEntry::new(sock()));
+        }
+        assert_eq!(state.lowest_free_fd(), Some(4));
+        state.sockets.remove(&2);
+        assert_eq!(
+            state.lowest_free_fd(),
+            Some(2),
+            "a closed fd number is reused"
+        );
+        state.sockets.clear();
+        assert_eq!(state.lowest_free_fd(), Some(1));
+    }
+
+    fn run_waitselect_program(words: &[u16], mem: FlatMemory) -> Result<i32, String> {
+        let entry = TRAP_TABLE_END;
+        let mut mem = mem;
+        load_words(&mut mem, entry, words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x400,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn waitselect_with_nothing_to_wait_for_fails_loudly_instead_of_hanging_363() {
+        // No fds, NULL timeout, no signal mask: nothing could ever end
+        // the call, which used to be `poll(.., -1)` forever.
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, 0);
+        push_move_imm_d(&mut words, 1, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect
+        words.push(RTS);
+        let err = run_waitselect_program(&words, FlatMemory::new(0x2_0000)).unwrap_err();
+        assert!(err.contains("would block forever"), "{err}");
+    }
+
+    #[test]
+    fn dup2socket_past_the_descriptor_table_is_ebadf_363() {
+        // Dup2Socket(s, 0x7FFFFFFF) used to wrap the fd counter onto a
+        // live descriptor; a real dup2() past the table size is EBADF.
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> fd 1
+        push_move_imm_d(&mut words, 0, 1);
+        push_move_imm_d(&mut words, 1, 0x7FFF_FFFF);
+        words.extend_from_slice(&jsr_disp16_a6(-264)); // Dup2Socket
+        words.push(RTS);
+        let code = run_waitselect_program(&words, FlatMemory::new(0x2_0000)).unwrap();
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn descriptor_numbers_stay_below_the_table_and_the_fd_set_size_363() {
+        let sock = || Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        // Fds 1..=63 fill a 64-entry table: the next must be EMFILE, not
+        // fd 64 (which Dup2Socket would then refuse as EBADF).
+        let mut state = BsdSocketState::new();
+        for fd in 1..64 {
+            state.sockets.insert(fd, SocketEntry::new(sock()));
+        }
+        assert_eq!(state.lowest_free_fd(), None);
+        // A raised table size never hands out an fd a 256-bit fd_set
+        // can't name, so WaitSelect can always report it.
+        state.dtablesize = 300;
+        assert_eq!(state.fd_limit(), 256);
+        assert_eq!(state.lowest_free_fd(), Some(64));
     }
 }
