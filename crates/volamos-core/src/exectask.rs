@@ -1290,7 +1290,7 @@ pub(crate) fn spawn_process<C: Cpu>(
     // Last, so a failure above leaves no duplicated lock or parked state
     // behind for a process that never starts.
     let caller_home_dir = ctx.mem.read_u32(parent + PR_HOMEDIR_OFFSET);
-    let (child_state, current_dir, home_dir) = ctx.dos.new_process_state(
+    let (mut child_state, current_dir, home_dir) = ctx.dos.new_process_state(
         ctx.heap,
         ctx.mem,
         spec.current_dir,
@@ -1298,6 +1298,12 @@ pub(crate) fn spawn_process<C: Cpu>(
         caller_home_dir,
         spec.copy_vars,
     );
+    // The arguments (`SystemTagList`'s command line) are also what the
+    // child's `ReadArgs(NULL)` reads from its `Input()`, as `RunCommand`
+    // arranges for its command.
+    if let Some(bytes) = &spec.args {
+        child_state.input_buf = bytes.clone();
+    }
     ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
     ctx.mem.write_u32(task + PR_HOMEDIR_OFFSET, home_dir);
     if current_dir != 0 {
@@ -7426,5 +7432,36 @@ mod tests {
             &|marker| load_d0_from(marker).to_vec(),
         );
         assert_eq!(code, 0, "the child saw its parent's variable");
+    }
+
+    /// `SetFileSysTask(D0)` with `A6` = dos.library.
+    fn set_file_sys_task_words(value: u32) -> Vec<u16> {
+        let mut w = imm_to_d(1, value).to_vec();
+        w.extend_from_slice(&jsr_disp16_a6(-528));
+        w
+    }
+
+    #[test]
+    fn a_childs_set_file_sys_task_does_not_change_the_parents_326() {
+        let code = run_parent_and_child(
+            &set_file_sys_task_words(7),
+            &|_| set_file_sys_task_words(99),
+            &|_| jsr_disp16_a6(-522).to_vec(), // GetFileSysTask
+        );
+        assert_eq!(code, 7, "pr_FileSystemTask belongs to the process");
+    }
+
+    #[test]
+    fn a_child_starts_with_its_parents_file_system_task_326() {
+        let code = run_parent_and_child(
+            &set_file_sys_task_words(7),
+            &|marker| {
+                let mut w = jsr_disp16_a6(-522).to_vec();
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        assert_eq!(code, 7, "CreateNewProc copies pr_FileSystemTask");
     }
 }
