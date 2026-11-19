@@ -6774,4 +6774,132 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 42);
     }
+
+    // Per-process DOS state (issue #326). Each case runs a parent and a
+    // `CreateNewProc` child that interleave through `Wait`/`Signal`, and
+    // reports what the *parent* sees afterwards as the exit code.
+
+    /// `move.l #imm,dN` as three words.
+    fn imm_to_d(n: u16, value: u32) -> [u16; 3] {
+        [move_imm_to_d(n), (value >> 16) as u16, value as u16]
+    }
+
+    /// `SetIoErr(code)` with `A6` = dos.library.
+    fn set_io_err_words(code: u32) -> Vec<u16> {
+        let mut w = imm_to_d(1, code).to_vec();
+        w.extend_from_slice(&jsr_disp16_a6(-462));
+        w
+    }
+
+    /// `move.l d0,(addr).l`.
+    fn store_d0_at(addr: u32) -> [u16; 3] {
+        [0x23C0, (addr >> 16) as u16, addr as u16]
+    }
+
+    /// `move.l (addr).l,d0`.
+    fn load_d0_from(addr: u32) -> [u16; 3] {
+        [0x2039, (addr >> 16) as u16, addr as u16]
+    }
+
+    /// Runs `before_spawn` in the parent, then spawns a child running
+    /// `child_body`, then the parent waits for the child to finish and
+    /// runs `after_wait`. The program's exit code is the parent's `D0`
+    /// when `after_wait` ends. `A6` is dos.library at the start of each
+    /// of the three pieces. `child_body` and `after_wait` are given the
+    /// address of a shared word (`store_d0_at`/`load_d0_from`) the child
+    /// can use to report to the parent.
+    fn run_parent_and_child(
+        before_spawn: &[u16],
+        child_body: &dyn Fn(u32) -> Vec<u16>,
+        after_wait: &dyn Fn(u32) -> Vec<u16>,
+    ) -> i32 {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        // The shared word and the tag list sit after the code; the code's
+        // size doesn't depend on those addresses (every immediate is a
+        // full 32 bits), so build once to measure and again for real.
+        let build = |marker: u32, tags_addr: u32| {
+            let mut words = Vec::new();
+            words.extend_from_slice(&movea_dos_base_to_a6());
+            words.extend_from_slice(before_spawn);
+            words.extend_from_slice(&movea_dos_base_to_a6());
+            words.extend_from_slice(&imm_to_d(1, tags_addr));
+            words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+            words.extend_from_slice(&movea_exec_base_to_a6());
+            words.extend_from_slice(&imm_to_d(0, 0x0001_0000));
+            words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+            words.extend_from_slice(&movea_dos_base_to_a6());
+            words.extend_from_slice(&after_wait(marker));
+            words.push(RTS);
+
+            let child_entry = entry + (words.len() as u32) * 2;
+            words.extend_from_slice(&movea_dos_base_to_a6());
+            words.extend_from_slice(&child_body(marker));
+            words.extend_from_slice(&movea_exec_base_to_a6());
+            let parent_imm_idx = words.len();
+            words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+            words.extend_from_slice(&[0, 0]);
+            words.extend_from_slice(&imm_to_d(0, 0x0001_0000));
+            words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+            words.push(RTS); // -> the task-exit stub
+            (words, child_entry, parent_imm_idx)
+        };
+        let (measured, ..) = build(0, 0);
+        let marker = entry + (measured.len() as u32) * 2 + 16;
+        let tags_addr = marker + 16;
+        let (words, child_entry, parent_imm_idx) = build(marker, tags_addr);
+        let load_end = tags_addr + 32;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(entry + (parent_imm_idx as u32) * 2 + 2, parent_task);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn a_childs_failed_call_does_not_change_the_parents_io_err_326() {
+        // Real `IoErr()` is `pr_Result2` of the calling process. The
+        // child's `SetIoErr(222)` must not show up in the parent's.
+        let code = run_parent_and_child(
+            &set_io_err_words(111),
+            &|_| set_io_err_words(222),
+            &|_| jsr_disp16_a6(-132).to_vec(), // IoErr
+        );
+        assert_eq!(code, 111, "the parent's IoErr belongs to the parent");
+    }
+
+    #[test]
+    fn a_child_starts_with_a_clean_io_err_and_keeps_its_own_326() {
+        // The child starts at 0, not its parent's 111, and sets its own
+        // value; the parent reads back what the child saw first.
+        let child_first = |marker: u32| {
+            let mut w = jsr_disp16_a6(-132).to_vec(); // IoErr
+            w.extend_from_slice(&store_d0_at(marker));
+            w.extend_from_slice(&set_io_err_words(222));
+            w
+        };
+        let code = run_parent_and_child(&set_io_err_words(111), &child_first, &|marker| {
+            load_d0_from(marker).to_vec()
+        });
+        assert_eq!(code, 0, "a new process doesn't inherit its parent's IoErr");
+    }
 }
