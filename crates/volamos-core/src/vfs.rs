@@ -319,6 +319,87 @@ pub struct VfsConfig {
     pub lazy_volumes: Vec<LazyVolume>,
 }
 
+impl VfsConfig {
+    /// Makes sure `dir` (a host directory) is reachable through some
+    /// volume: if no configured volume's root contains it, adds one
+    /// rooted at `dir` itself and returns its name. `None` when `dir`
+    /// was already covered, or does not exist.
+    ///
+    /// The name is the directory's own (a volume labelled after its
+    /// disk, as on a real machine), with `:` and `/` replaced and cut to
+    /// 30 characters, `PROG` for a directory with no name (`/`), and
+    /// made unique against every volume and assign name already present
+    /// (case-insensitively) with a numeric suffix. It is appended last,
+    /// so it never changes which volume is "the first" for the default
+    /// current directory.
+    ///
+    /// This is what lets a program started from a directory no `-V`
+    /// covers still have a `PROGDIR:` and a home directory, and a
+    /// `--workbench` start pass locks for its own and its project files'
+    /// directories.
+    pub fn cover_host_dir(&mut self, dir: &Path) -> Option<String> {
+        let canon = std::fs::canonicalize(dir).ok().filter(|d| d.is_dir())?;
+        // The internal `--libs-dir` volume is an implementation detail the
+        // guest must never be handed a path on, so it covers nothing.
+        let covered = self
+            .volumes
+            .iter()
+            .filter(|(name, _)| name != crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME)
+            .any(|(_, root)| {
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                canon.starts_with(root)
+            });
+        if covered {
+            return None;
+        }
+        let base: String = canon
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .map(|c| {
+                if c == ':' || c == '/' || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .take(30)
+            .collect();
+        let base = if base.is_empty() {
+            "PROG".to_string()
+        } else {
+            base
+        };
+        // Names a program's directory must not take: the assign
+        // `set_program_dir` installs and the DOS devices.
+        const RESERVED: [&str; 7] = ["PROGDIR", "NIL", "CON", "RAW", "PIPE", "PRT", "*"];
+        let auto_root = self.auto_assign_root.clone();
+        let taken = |name: &str| {
+            RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+                || self
+                    .volumes
+                    .iter()
+                    .map(|(n, _)| n)
+                    .chain(self.assigns.iter().map(|(n, _)| n))
+                    .any(|n| n.eq_ignore_ascii_case(name))
+                // `--auto-assign` would resolve `name:` to a directory
+                // under its root: do not shadow one that exists.
+                || auto_root.as_ref().is_some_and(|root| root.join(name).exists())
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while taken(&name) {
+            let suffix = format!("_{n}");
+            let keep: String = base.chars().take(30 - suffix.len()).collect();
+            name = format!("{keep}{suffix}");
+            n += 1;
+        }
+        self.volumes.push((name.clone(), canon));
+        Some(name)
+    }
+}
+
 /// Result of [`Vfs::resolve_with_amiga_path`]: a resolved host path plus
 /// the normalized Amiga path that reached it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1966,5 +2047,138 @@ mod tests {
             vfs.resolve("/", ResolveMode::MustExist).unwrap(),
             tmp.path()
         );
+    }
+}
+
+#[cfg(test)]
+mod cover_host_dir_tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("volamos-cover-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_uncovered_directory_becomes_a_volume_named_after_it() {
+        let root = temp("named");
+        let work = root.join("work dir");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut config = VfsConfig::default();
+        assert_eq!(config.cover_host_dir(&work).as_deref(), Some("work dir"));
+        assert_eq!(config.volumes.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_inside_an_existing_volume_is_left_alone() {
+        let root = temp("inside");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![("DH0".to_string(), root.clone())],
+            ..VfsConfig::default()
+        };
+        assert_eq!(config.cover_host_dir(&sub), None);
+        assert_eq!(config.cover_host_dir(&root), None);
+        assert_eq!(config.volumes.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_name_is_made_unique_against_volumes_and_assigns() {
+        let root = temp("unique");
+        let a = root.join("sys");
+        std::fs::create_dir_all(&a).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![("SYS".to_string(), root.join("elsewhere"))],
+            assigns: vec![("SYS_2".to_string(), vec!["SYS:".to_string()])],
+            ..VfsConfig::default()
+        };
+        assert_eq!(config.cover_host_dir(&a).as_deref(), Some("sys_3"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_libs_override_volume_does_not_count_as_covering() {
+        let root = temp("libs");
+        let prog = root.join("prog");
+        std::fs::create_dir_all(&prog).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![(
+                crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME.to_string(),
+                root.clone(),
+            )],
+            ..VfsConfig::default()
+        };
+        assert_eq!(config.cover_host_dir(&prog).as_deref(), Some("prog"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reserved_and_auto_assigned_names_are_not_taken() {
+        let root = temp("reserved");
+        let progdir = root.join("progdir");
+        let work = root.join("work");
+        let auto = root.join("auto");
+        std::fs::create_dir_all(&progdir).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(auto.join("work")).unwrap();
+        let mut config = VfsConfig {
+            auto_assign_root: Some(auto),
+            ..VfsConfig::default()
+        };
+        assert_eq!(
+            config.cover_host_dir(&progdir).as_deref(),
+            Some("progdir_2")
+        );
+        assert_eq!(config.cover_host_dir(&work).as_deref(), Some("work_2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_name_stays_within_30_characters_with_its_suffix() {
+        let root = temp("long");
+        let long = root.join("a".repeat(40));
+        std::fs::create_dir_all(&long).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![("a".repeat(30), root.join("other"))],
+            ..VfsConfig::default()
+        };
+        let name = config.cover_host_dir(&long).unwrap();
+        assert_eq!(name.len(), 30);
+        assert!(name.ends_with("_2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_directory_adds_nothing() {
+        let mut config = VfsConfig::default();
+        assert_eq!(
+            config.cover_host_dir(Path::new("/nonexistent/volamos/dir")),
+            None
+        );
+        assert!(config.volumes.is_empty());
+    }
+
+    #[test]
+    fn the_new_volume_resolves_back_to_the_directory() {
+        let root = temp("resolve");
+        std::fs::write(root.join("f.txt"), b"x").unwrap();
+        let mut config = VfsConfig::default();
+        let name = config.cover_host_dir(&root).unwrap();
+        config.cwd = format!("{name}:");
+        let vfs = Vfs::new(config).unwrap();
+        assert_eq!(
+            vfs.amiga_path_for_host_dir(&root).as_deref(),
+            Some(format!("{name}:").as_str())
+        );
+        assert!(
+            vfs.resolve(&format!("{name}:f.txt"), ResolveMode::MustExist)
+                .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
