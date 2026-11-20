@@ -580,6 +580,11 @@ pub const NT_PROCESS: u8 = 13;
 /// what a real AmigaOS Shell maps a host Ctrl-C onto, and what
 /// [`fold_pending_host_break`] folds a host `SIGINT`/`SIGTERM` into.
 pub const SIGBREAKF_CTRL_C: u32 = 1 << 12;
+/// `SIGBREAKF_CTRL_D`/`E`/`F` (bits 13-15), per `<exec/exec.h>`: what the
+/// console raises for `Ctrl+D`/`E`/`F` in raw mode ([`crate::hostterm`]).
+pub const SIGBREAKF_CTRL_D: u32 = 1 << 13;
+pub const SIGBREAKF_CTRL_E: u32 = 1 << 14;
+pub const SIGBREAKF_CTRL_F: u32 = 1 << 15;
 
 /// Initial value of `tc_SigAlloc`: signal bits 0-15 are reserved for
 /// system use and start out pre-allocated on a real kernel (`AllocSignal`
@@ -777,9 +782,16 @@ pub fn install_host_break_handler() {
 /// woken main task still only runs at the next switch point -- there is
 /// no preemption).
 pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler) {
+    // `Ctrl+D`/`E`/`F` typed in raw mode (issue #315) travel with the
+    // `SIGINT`: the same console, the same task, the same delivery points.
+    crate::hostterm::pump_console_breaks();
+    let mut breaks = crate::hostterm::take_console_breaks();
     if PENDING_HOST_BREAK.swap(false, Ordering::SeqCst) {
+        breaks |= SIGBREAKF_CTRL_C;
+    }
+    if breaks != 0 {
         let main = tasks.main();
-        let recvd = mem.read_u32(main + TC_SIGRECVD) | SIGBREAKF_CTRL_C;
+        let recvd = mem.read_u32(main + TC_SIGRECVD) | breaks;
         mem.write_u32(main + TC_SIGRECVD, recvd);
         if main != tasks.current() {
             tasks.wake_if_signal_matches(main, recvd);
@@ -1848,6 +1860,24 @@ fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
         // deadlock. Fire the earliest one and retry; this loop ends
         // either once something's satisfied or once there are no more
         // pending timers to fall back on.
+        // A guest waiting for a console break key (issue #315) on a raw
+        // console is also woken by the user: wait for the terminal, up to
+        // the earliest pending timer if there is one, deliver whatever it
+        // raised and look again. Once that timer is due (or the terminal
+        // has hung up) fall through to firing it.
+        if signal_set & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F)
+            != 0
+            && crate::hostterm::stdin_is_raw()
+        {
+            let deadline = ctx.timers.earliest_deadline();
+            if deadline.is_none_or(|d| std::time::Instant::now() < d)
+                && crate::hostterm::wait_for_console_input_until(deadline)
+            {
+                crate::hostterm::pump_console_breaks_now();
+                fold_pending_host_break(ctx.mem, ctx.tasks);
+                continue;
+            }
+        }
         if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
             // No other task could ever satisfy this, and no pending
             // timer either -- a real deadlock, not just "no
@@ -2755,6 +2785,15 @@ impl PendingTimers {
         bound: std::time::Instant,
     ) -> bool {
         self.fire_earliest_impl(mem, tasks, Some(bound))
+    }
+
+    /// When the earliest still-pending entry is due.
+    fn earliest_deadline(&self) -> Option<std::time::Instant> {
+        self.entries
+            .iter()
+            .filter(|e| !e.elapsed)
+            .map(|e| e.deadline)
+            .min()
     }
 
     fn fire_earliest_impl<M: AddressSpace>(
