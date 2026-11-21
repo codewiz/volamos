@@ -272,6 +272,10 @@ Changelog.
   `byteSize + 4` in the 4 bytes before the block, so its result is 4 mod 8 --
   as on exec, and independent of the program's size), memory
   pools (`CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`),
+  `AllocAbs` (claims memory at a given address, truncated down to an
+  8-byte boundary with the size grown to still cover the range; `NULL` if
+  any of it is in use or outside the heap; `FreeMem` takes the block back
+  with either the returned address or the location you asked for),
   `AllocEntry`/`FreeEntry` (per-entry `MEMF_CLEAR` honoured; a partial
   failure backs out fully, the post-SetPatch/V36+ behavior, and returns
   the failed entry's requirements with bit 31 set), and the raw

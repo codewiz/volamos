@@ -372,6 +372,46 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// `AllocAbs` (LVO -204): `D0` = byte size, `A1` = the address the memory
+/// MUST be at. `D0` = the block, or `0` when any of it is in use or
+/// outside the heap. Semantics from NDK 3.2 `exec.doc`: the block "may not
+/// be exactly the same as the requested block because of rounding", but
+/// is "guaranteed to contain the requested range" -- so the location is
+/// truncated down to an 8-byte [`MEMBLOCKSIZE`] boundary, the size grown by
+/// what was cut off and rounded up to 8, and that truncated address is
+/// what comes back; `FreeMem` takes either that or the original location
+/// (it applies the same truncation). A zero size fails, as for
+/// `AllocMem`. The memory is not cleared, which matches real `AllocAbs`
+/// (it leaves it to the caller), and under `--sanitize` it reads as
+/// uninitialized like any `AllocMem` without `MEMF_CLEAR`.
+///
+/// Found needed by MMULib's `mmu.library`, which `AllocAbs`es regions of
+/// the memory map while it builds its tables (#409).
+fn alloc_abs_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let byte_size = ctx.cpu.data_register(DataRegister(0));
+    let location = ctx.cpu.address_register(AddressRegister(1));
+
+    let skipped = location & (MEMBLOCKSIZE - 1);
+    let start = location - skipped;
+    let result = byte_size
+        .checked_add(skipped)
+        .filter(|_| byte_size != 0)
+        .and_then(|grown| {
+            let rounded = grown.checked_next_multiple_of(MEMBLOCKSIZE)?;
+            let addr = ctx.heap.alloc_abs(&mut *ctx.mem, start, rounded, grown)?;
+            Some((addr, rounded))
+        });
+    match result {
+        Some((addr, rounded)) => {
+            apply_dirty_fill(ctx, addr, rounded);
+            poison_allocation_edges(ctx, addr, true);
+            ctx.cpu.set_data_register(DataRegister(0), addr);
+        }
+        None => ctx.cpu.set_data_register(DataRegister(0), 0),
+    }
+    Ok(())
+}
+
 /// `FreeMem` (LVO -210): `A1` = memory block, `D0` = byte size. See the
 /// module docs for the NULL-is-a-no-op and size-mismatch-is-loud-failure
 /// decisions.
@@ -384,7 +424,22 @@ fn free_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         return Ok(());
     }
 
-    let rounded = round_up_8(byte_size);
+    // An address no block starts at, and that is not 8-aligned, is
+    // treated as exec's `Deallocate` treats every one: cut back to the
+    // 8-byte boundary, the size grown by what was cut and rounded up. That
+    // is how a block `AllocAbs` made at an unaligned location is freed
+    // with the location and size it was asked for. An address that *is* a
+    // live block (a 4-mod-8 `AllocVec` one, say) is taken as it stands.
+    let (addr, rounded) =
+        if ctx.heap.size_of_live_alloc(addr).is_none() && !addr.is_multiple_of(MEMBLOCKSIZE) {
+            let skipped = addr % MEMBLOCKSIZE;
+            (
+                addr - skipped,
+                round_up_8(byte_size.saturating_add(skipped)),
+            )
+        } else {
+            (addr, round_up_8(byte_size))
+        };
     let recorded = ctx.heap.size_of_live_alloc(addr);
     match recorded {
         Some(actual) if actual == rounded => {
@@ -1244,6 +1299,7 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     }
     reg!("AllocMem", alloc_mem_handler::<C>);
     reg!("TypeOfMem", type_of_mem_handler::<C>);
+    reg!("AllocAbs", alloc_abs_handler::<C>);
     reg!("FreeMem", free_mem_handler::<C>);
     reg!("AvailMem", avail_mem_handler::<C>);
     reg!("AllocVec", alloc_vec_handler::<C>);
@@ -2877,5 +2933,123 @@ mod tests {
             assert_eq!(got, header, "AllocVec({size}) header");
             assert_eq!(ptr % 8, 4, "AllocVec({size}) is 4 mod 8");
         }
+    }
+
+    // --- AllocAbs (-204) ---
+
+    /// A free spot in the guest heap well clear of the program and the
+    /// runtime's own early allocations.
+    const ABS_AT: u32 = 0xC000;
+
+    /// `move.l #n,d0`, `move.l #loc,a1`, `jsr AllocAbs(a6)`.
+    fn alloc_abs_call(words: &mut Vec<u16>, size: u32, location: u32) {
+        words.extend_from_slice(&[
+            move_imm_to_d(0),
+            (size >> 16) as u16,
+            size as u16,
+            move_imm_to_a(1),
+            (location >> 16) as u16,
+            location as u16,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-204));
+    }
+
+    fn run_alloc_abs(build: impl Fn(&mut Vec<u16>)) -> u32 {
+        let mut words = Vec::new();
+        build(&mut words);
+        words.push(RTS);
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed") as u32
+    }
+
+    #[test]
+    fn alloc_abs_returns_the_requested_free_address() {
+        assert_eq!(run_alloc_abs(|w| alloc_abs_call(w, 0x100, ABS_AT)), ABS_AT);
+    }
+
+    /// The location is cut back to an 8-byte boundary and the size grown
+    /// by what was cut, so the block still holds the requested range
+    /// (`exec.doc`): 0x10 bytes at +4 becomes 0x18 bytes at +0, and the
+    /// next 8-aligned address after that is still free.
+    #[test]
+    fn alloc_abs_truncates_an_unaligned_location_and_covers_the_range() {
+        assert_eq!(
+            run_alloc_abs(|w| alloc_abs_call(w, 0x10, ABS_AT + 4)),
+            ABS_AT
+        );
+        // 0x10 bytes at +4 reach +0x14, so a claim starting at +0x10
+        // collides with that block, while +0x18 is free.
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x10, ABS_AT + 4);
+                alloc_abs_call(w, 8, ABS_AT + 0x10);
+            }),
+            0
+        );
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x10, ABS_AT + 4);
+                alloc_abs_call(w, 8, ABS_AT + 0x18);
+            }),
+            ABS_AT + 0x18
+        );
+    }
+
+    #[test]
+    fn alloc_abs_of_memory_in_use_or_nothing_is_null() {
+        // Already claimed.
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x100, ABS_AT);
+                alloc_abs_call(w, 0x10, ABS_AT + 0x40);
+            }),
+            0
+        );
+        // Zero bytes, outside any memory, and across the end of the heap.
+        assert_eq!(run_alloc_abs(|w| alloc_abs_call(w, 0, ABS_AT)), 0);
+        assert_eq!(run_alloc_abs(|w| alloc_abs_call(w, 0x100, 0x40_0000)), 0);
+        assert_eq!(run_alloc_abs(|w| alloc_abs_call(w, 0x100, 0x1_FFF0)), 0);
+    }
+
+    /// What `AllocAbs` returns is a normal block: `FreeMem` takes it back
+    /// (with the size the caller asked for), after which the same range
+    /// can be claimed again.
+    /// A block made at an unaligned location is freed with that location
+    /// and size, as on exec (whose `Deallocate` cuts the address back and
+    /// grows the size the same way): the whole 8-aligned block is free
+    /// again afterwards.
+    #[test]
+    fn freemem_of_an_unaligned_alloc_abs_location_frees_its_block() {
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x10, ABS_AT + 4);
+                w.extend_from_slice(&[
+                    move_imm_to_a(1),
+                    ((ABS_AT + 4) >> 16) as u16,
+                    (ABS_AT + 4) as u16,
+                    move_imm_to_d(0),
+                    0,
+                    0x10,
+                ]);
+                w.extend_from_slice(&jsr_disp16_a6(-210)); // FreeMem(location, size)
+                alloc_abs_call(w, 0x18, ABS_AT);
+            }),
+            ABS_AT
+        );
+    }
+
+    #[test]
+    fn alloc_abs_memory_can_be_freed_and_claimed_again() {
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x100, ABS_AT);
+                w.push(move_d0_to_a(1)); // A1 = the block
+                w.extend_from_slice(&[move_imm_to_d(0), 0, 0x100]);
+                w.extend_from_slice(&jsr_disp16_a6(-210)); // FreeMem
+                alloc_abs_call(w, 0x100, ABS_AT);
+            }),
+            ABS_AT
+        );
     }
 }
